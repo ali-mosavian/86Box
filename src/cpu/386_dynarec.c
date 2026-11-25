@@ -342,14 +342,10 @@ dr_blocks_cache(void)
 int32_t         cycles_main = 0;
 /* Linear address where the block that ran last started; the profiler charges a sample to it. */
 uint32_t        cpu_exec_start_pc;
-#    ifdef CODEGEN_BACKEND_HAS_BLOCK_LINK
-/* The block link routine does the loop-top stores itself. */
+/* The block link routine does the loop-top stores itself; codegen_fpu_sync()
+   reads them for guest time. */
 int32_t  cycles_old = 0;
 uint64_t tsc_old    = 0;
-#    else
-static int32_t  cycles_old  = 0;
-static uint64_t tsc_old     = 0;
-#    endif
 
 #    ifdef CODEGEN_BACKEND_HAS_BLOCK_LINK
 /* Slot pair returned by the last compiled block, while the loop has run

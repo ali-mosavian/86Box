@@ -13,6 +13,7 @@
 ;   7  A: jz on an xorshift bit   B: jz never taken
 ;   8  A: fdiv + 40 independent adds   B: fdiv alone
 ;   9  A: fdiv ; fdiv   B: fdiv alone
+;  10  A: add eax,imm (16x)   B: add eax,ebx (16x)
 ;   nasm -f bin -DTEST=1 pmbench.asm -o pmimul.com
         org     0x100
         bits    16
@@ -215,8 +216,11 @@ pm:     mov     ax, 0x10
 %%s:
 %endmacro
 %elif TEST = 8
+%ifndef NADD
+%define NADD 10
+%endif
 %macro  ADDS 0
-        %rep 10
+        %rep NADD
         add     eax, 1
         add     ebx, 1
         add     edx, 1
@@ -224,7 +228,9 @@ pm:     mov     ax, 0x10
         %endrep
 %endmacro
 %macro  BODY_A 0
+%ifndef NOFDIV
         fdiv    st0, st1
+%endif
         ADDS
 %endmacro
 %macro  BODY_B 0
@@ -237,6 +243,17 @@ pm:     mov     ax, 0x10
 %endmacro
 %macro  BODY_B 0
         fdiv    st0, st1
+%endmacro
+%elif TEST = 10
+%macro  BODY_A 0
+        %rep 16
+        add     eax, 1
+        %endrep
+%endmacro
+%macro  BODY_B 0
+        %rep 16
+        add     eax, ebx
+        %endrep
 %endmacro
 %endif
 

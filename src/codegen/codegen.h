@@ -451,6 +451,10 @@ extern int cpu_notreps;
 extern int codegen_block_cycles;
 extern int codegen_bp_penalty;
 extern void codegen_bp_resolve(uint32_t pc, uint32_t flags);
+extern int  codegen_fpu_x87;
+extern int  codegen_fpu_busy;
+extern void codegen_fpu_block_start(void);
+extern void codegen_fpu_sync(uint32_t own, uint32_t flags);
 
 extern void (*codegen_timing_start)(void);
 extern void (*codegen_timing_prefix)(uint8_t prefix, uint32_t fetchdat);

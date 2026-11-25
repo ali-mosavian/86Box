@@ -1557,6 +1557,7 @@ codegen_block_start_recompile(codeblock_t *block)
 
     codegen_block_cycles = 0;
     codegen_timing_block_start();
+    codegen_fpu_block_start();
 
     recomp_page = block->phys & ~0xfff;
 
@@ -1829,9 +1830,16 @@ codegen_block_end_recompile(codeblock_t *block)
     int      drain_from;
 
     codegen_accumulate_record(ACC_END, 0, 0, 0, 0, 0);
-    drain_from = codegen_block_cycles;
+    drain_from      = codegen_block_cycles;
+    codegen_fpu_x87 = 0;
     codegen_timing_block_end();
     codegen_exit_end_charge_apply(ir_data, codegen_block_cycles - drain_from);
+    if (codegen_fpu_x87 & 2) {
+        codegen_accumulate_flush(ir_data);
+        uop_LOAD_FUNC_ARG_IMM(ir_data, 0, codegen_block_cycles);
+        uop_LOAD_FUNC_ARG_IMM(ir_data, 1, (codegen_fpu_busy & 0xffff) | (1 << 17));
+        uop_CALL_FUNC(ir_data, codegen_fpu_sync);
+    }
     codegen_accumulate_timing(ir_data);
 
     if (block->flags & CODEBLOCK_IN_DIRTY_LIST)

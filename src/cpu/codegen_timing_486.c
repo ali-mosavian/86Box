@@ -14,6 +14,7 @@
 #include "codegen.h"
 #include "codegen_ops.h"
 #include "codegen_timing_common.h"
+#include "x87_timings.h"
 
 #define CYCLES(c)         (int *) c
 #define CYCLES2(c16, c32) (int *) ((-1 & ~0xffff) | c16 | (c32 << 8))
@@ -283,7 +284,7 @@ static int *opcode_timings_486_8x[8] = {
 };
 static int *opcode_timings_486_8x_mod3[8] = {
     // clang-format off
-        &timing_mr,     &timing_mr,     &timing_mr,     &timing_mr,     &timing_mr,     &timing_mr,     &timing_mr,     &timing_rm
+        &timing_rr,     &timing_rr,     &timing_rr,     &timing_rr,     &timing_rr,     &timing_rr,     &timing_rr,     &timing_rr
     // clang-format on
 };
 static int *opcode_timings_486_81[8] = {
@@ -293,7 +294,7 @@ static int *opcode_timings_486_81[8] = {
 };
 static int *opcode_timings_486_81_mod3[8] = {
     // clang-format off
-        &timing_mr,     &timing_mr,     &timing_mr,     &timing_mr,     &timing_mr,     &timing_mr,     &timing_mr,     &timing_rm
+        &timing_rr,     &timing_rr,     &timing_rr,     &timing_rr,     &timing_rr,     &timing_rr,     &timing_rr,     &timing_rr
     // clang-format on
 };
 
@@ -314,10 +315,90 @@ COUNT(int *c, int op_32)
     return *c;
 }
 
+/*
+ * x87 concurrency (Intel i486 Processor Programmer's Reference Manual, floating
+ * point instruction clock counts; 86Box's x87_concurrency_486, which holds the
+ * same figures). Of an instruction's clocks the last "concurrent" ones run in
+ * the FPU while the integer unit goes on: FDIV 73 clocks, 70 concurrent; FMUL
+ * 16/13; FADD 8-20/7. The next x87 instruction waits for the FPU. fpu_busy is
+ * the FPU time still to run, in cycles of the integer timeline. It is tracked
+ * within a block; codegen_fpu_sync carries it across blocks.
+ */
+static int fpu_busy;
+
+static int
+fpu_concurrent_486(int prefix, int modrm)
+{
+    const x87_timings_t *c    = &x87_concurrency_486;
+    const int            reg  = (modrm >> 3) & 7;
+    const int            mod3 = (modrm & 0xc0) == 0xc0;
+
+    switch (prefix) {
+        case 0xd8:
+        case 0xdc:
+        case 0xde:
+            switch (reg) {
+                case 1:
+                    return mod3 ? c->fmul : prefix == 0xd8 ? c->fmul_32 : prefix == 0xdc ? c->fmul_64 : c->fmul_i16;
+                case 2:
+                case 3:
+                    return c->fcom;
+                case 6:
+                case 7:
+                    return c->fdiv;
+                default:
+                    return c->fadd;
+            }
+        case 0xda:
+            return mod3 ? c->fucom : reg == 1 ? c->fmul_i32 : reg >= 6 ? c->fdiv_i32 : reg >= 2 && reg <= 3 ? c->fcom_i32 : c->fadd_i32;
+        case 0xd9:
+            if (!mod3)
+                return 0;
+            switch (modrm) {
+                case 0xe8 ... 0xee:
+                    return c->fld_const;
+                case 0xf0:
+                    return c->f2xm1;
+                case 0xf1:
+                    return c->fyl2x;
+                case 0xf2:
+                    return c->fptan;
+                case 0xf3:
+                    return c->fpatan;
+                case 0xf4:
+                    return c->fxtract;
+                case 0xf5:
+                    return c->fprem1;
+                case 0xf8:
+                    return c->fprem;
+                case 0xf9:
+                    return c->fyl2xp1;
+                case 0xfa:
+                    return c->fsqrt;
+                case 0xfb:
+                    return c->fsincos;
+                case 0xfd:
+                    return c->fscale;
+                case 0xfe:
+                case 0xff:
+                    return c->fsin_cos;
+                default:
+                    return 0;
+            }
+        case 0xdb:
+            return mod3 ? 0 : (reg == 0 ? c->fild_32 : 0);
+        case 0xdf:
+            return mod3 ? 0 : (reg == 0 ? c->fild_16 : reg == 5 ? c->fild_64 : 0);
+        default:
+            return 0;
+    }
+}
+
 void
 codegen_timing_486_block_start(void)
 {
     regmask_modified = 0;
+    fpu_busy         = 0;
 }
 
 void
@@ -353,6 +434,8 @@ has_base_index(uint32_t fetchdat, int op_32)
 void
 codegen_timing_486_opcode(uint8_t opcode, uint32_t fetchdat, int op_32, UNUSED(uint32_t op_pc))
 {
+    const uint8_t raw_opcode = opcode;
+
     int           **timings;
     const uint64_t *deps;
     int             mod3 = ((fetchdat & 0xc0) == 0xc0);
@@ -454,11 +537,23 @@ codegen_timing_486_opcode(uint8_t opcode, uint32_t fetchdat, int op_32, UNUSED(u
             }
     }
 
-    timing_count += COUNT(timings[opcode], op_32);
+    int own_count = COUNT(timings[opcode], op_32);
+    timing_count += own_count;
     if (!mod3 && has_base_index(fetchdat, op_32))
         timing_count++; /*base+index addressing: one extra cycle (i486 programmer's reference)*/
     if (regmask_modified & get_addr_regmask(deps[opcode], fetchdat, op_32))
         timing_count++; /*AGI stall*/
+    if (last_prefix >= 0xd8 && last_prefix <= 0xdf) {
+        const int concurrent = MIN(fpu_concurrent_486(last_prefix, raw_opcode), own_count);
+
+        timing_count += fpu_busy; /*an x87 instruction waits for the one before*/
+        timing_count -= concurrent;
+        fpu_busy         = concurrent;
+        codegen_fpu_x87  = 3; /*waits for the FPU and leaves it busy*/
+        codegen_fpu_busy = concurrent;
+    } else if (fpu_busy) {
+        fpu_busy -= MIN(fpu_busy, timing_count);
+    }
     codegen_block_cycles += timing_count;
 
     regmask_modified = get_dstdep_mask(deps[opcode], fetchdat, bit8);
