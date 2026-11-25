@@ -134,6 +134,9 @@ cmd_status(int fd)
     cJSON_AddNumberToObject(o, "emu_ms", (double) (hl_emu_ns() / 1000000ull));
     cJSON_AddNumberToObject(o, "tsc", (double) tsc);
     cJSON_AddBoolToObject(o, "unthrottled", hl_unthrottled());
+    cJSON_AddNumberToObject(o, "cr0", cr0);
+    cJSON_AddBoolToObject(o, "cache_int", cpu_cache_int_enabled);
+    cJSON_AddBoolToObject(o, "cache_ext", cpu_cache_ext_enabled);
     txt = hl_screen_text(&is_text, &mode, &cols, &rows, &cx, &cy);
     free(txt);
     cJSON_AddNumberToObject(o, "video_mode", mode);
@@ -231,16 +234,13 @@ cmd_wait_text(client_t *c, const cJSON *req)
     return 0;
 }
 
-static void
-cmd_debug_out(int fd)
+/* Bytes above 0x7f become the Latin-1 code point of the same value. */
+static char *
+latin1_to_utf8(const char *raw, size_t n)
 {
-    char  *raw;
-    size_t n   = hl_debug_take(&raw);
     char  *out = malloc(n * 2 + 1);
     size_t o   = 0;
-    cJSON *obj = ok_obj();
 
-    /* Bytes above 0x7f become the Latin-1 code point of the same value. */
     for (size_t i = 0; i < n; i++) {
         const uint8_t b = (uint8_t) raw[i];
 
@@ -252,6 +252,17 @@ cmd_debug_out(int fd)
         }
     }
     out[o] = '\0';
+    return out;
+}
+
+static void
+cmd_debug_out(int fd)
+{
+    char  *raw;
+    size_t n   = hl_debug_take(&raw);
+    char  *out = latin1_to_utf8(raw, n);
+    cJSON *obj = ok_obj();
+
     cJSON_AddStringToObject(obj, "data", out);
     cJSON_AddNumberToObject(obj, "bytes", (double) n);
     free(raw);
@@ -429,15 +440,24 @@ hl_ctl_open(const char *path)
 void
 hl_ctl_announce_exit(int code)
 {
+    /* Debug bytes still unread would otherwise be lost with the process. */
+    char  *raw;
+    size_t n   = hl_debug_take(&raw);
+    char  *out = latin1_to_utf8(raw, n);
+
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clients[i].fd >= 0) {
             cJSON *o = cJSON_CreateObject();
 
             cJSON_AddStringToObject(o, "event", "exit");
             cJSON_AddNumberToObject(o, "code", code);
+            cJSON_AddNumberToObject(o, "emu_ms", (double) (hl_emu_ns() / 1000000ull));
+            cJSON_AddStringToObject(o, "data", out);
             reply(clients[i].fd, o);
         }
     }
+    free(raw);
+    free(out);
 }
 
 void

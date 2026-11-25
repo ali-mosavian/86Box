@@ -93,5 +93,9 @@ You can also support the project on Patreon:
 Acknowledgments
 ---------------
 
+### Headless build
+
+A windowless build driven over a unix socket, for automated benchmarking: see [src/headless/README.md](src/headless/README.md).
+
 ### Powered by
 [![JetBrains logo.](https://resources.jetbrains.com/storage/products/company/brand/logos/jetbrains.svg)](https://jb.gg/OpenSource)
