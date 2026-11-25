@@ -130,6 +130,22 @@ class Client:
         """Bytes the guest wrote to port 0xE9 since the previous call."""
         return str(self.call("debug_out")["data"])
 
+    def profile_start(self, interval_us: int = 20) -> None:
+        """Sample the guest PC every ``interval_us`` emulated microseconds."""
+        self.call("profile_start", interval_us=interval_us)
+
+    def profile_stop(self, path: str | Path) -> dict[str, Any]:
+        """Stop sampling and write ``{"interval_us", "samples", "pcs": {hexpc: count}}`` to ``path``.
+
+        Returns the counts only (``interval_us``, ``samples``, ``distinct``).
+        """
+        return self.call("profile_stop", path=str(Path(path).resolve()))
+
+    def mem_read(self, addr: int, length: int, path: str | Path) -> bytes:
+        """Read guest memory by linear address (through paging if on); also written to ``path``."""
+        self.call("mem_read", addr=addr, len=length, path=str(Path(path).resolve()))
+        return Path(path).read_bytes()
+
     def quit(self, code: int = 0) -> None:
         try:
             self.call("quit", code=code)
@@ -212,6 +228,7 @@ def run_dos(
     offset: int = 32256,
     timeout: float = 600.0,
     unthrottled: bool = True,
+    profile_us: int | None = None,
 ) -> RunResult:
     """Boot the VM, run one DOS program, and return its exit status and port 0xE9 output.
 
@@ -240,6 +257,8 @@ def run_dos(
         deadline = time.monotonic() + timeout
         try:
             with Client(sock, timeout=30.0) as c:
+                if profile_us:
+                    c.profile_start(profile_us)
                 while proc.poll() is None and time.monotonic() < deadline:
                     try:
                         text = c.screen_text()
@@ -294,6 +313,14 @@ def _main() -> int:
     p = sub.add_parser("wait")
     p.add_argument("pattern")
     p.add_argument("--timeout", type=float, default=30.0)
+    p = sub.add_parser("profile-start")
+    p.add_argument("--interval-us", type=int, default=20)
+    p = sub.add_parser("profile-stop")
+    p.add_argument("path")
+    p = sub.add_parser("mem-read")
+    p.add_argument("addr", type=lambda v: int(v, 0))
+    p.add_argument("len", type=lambda v: int(v, 0))
+    p.add_argument("path")
     p = sub.add_parser("sleep")
     p.add_argument("ms", type=float)
     p = sub.add_parser("quit")
@@ -332,6 +359,12 @@ def _main() -> int:
                     c.keys(args.text, args.key)
                 case "wait":
                     print(c.wait_text(args.pattern, args.timeout))
+                case "profile-start":
+                    c.profile_start(args.interval_us)
+                case "profile-stop":
+                    print(json.dumps(c.profile_stop(args.path)))
+                case "mem-read":
+                    c.mem_read(args.addr, args.len, args.path)
                 case "sleep":
                     c.sleep(args.ms)
                 case "debug":

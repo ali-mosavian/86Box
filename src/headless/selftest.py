@@ -9,12 +9,15 @@ been saved, so boot does not stop at the CMOS prompt).
 from __future__ import annotations
 
 import argparse
+import contextlib
+import json
 import re
 import signal
 import sys
 import tempfile
 import time
 import unittest
+from collections.abc import Iterator
 from pathlib import Path
 
 import hl86
@@ -41,29 +44,77 @@ class Headless(unittest.TestCase):
         self.assertEqual(r.code, 7)
         self.assertEqual(r.debug, "hello from the guest\n")
 
-    def test_text_follows_crtc_start_address(self) -> None:
-        """screen_text once read video memory from offset 0 and missed a scrolled screen."""
-        vm = Path(args.vms) / "qb-486"
-        com = EX / "crtcstart.com"
+    @contextlib.contextmanager
+    def hanging(self, com: str, vm_name: str = "qb-486") -> Iterator[hl86.Client]:
+        """Boot the VM running one .COM that never exits; AUTOEXEC.BAT is restored afterwards."""
+        vm = Path(args.vms) / vm_name
+        name = com.upper()
         orig = hl86.dos_get(vm / "c.img", "AUTOEXEC.BAT")
         with tempfile.TemporaryDirectory() as tmp:
             bat = Path(tmp) / "AUTOEXEC.BAT"
-            bat.write_bytes(b"@ECHO OFF\r\nPATH C:\\DOS\r\nC:\\CRTCSTAR.COM\r\n")
-            hl86.dos_put(vm / "c.img", com, "CRTCSTAR.COM")
+            bat.write_bytes(f"@ECHO OFF\r\nPATH C:\\DOS\r\nC:\\{name}\r\n".encode())
+            hl86.dos_put(vm / "c.img", EX / com, name)
             hl86.dos_put(vm / "c.img", bat, "AUTOEXEC.BAT")
-            sock = Path(tmp) / "s"
-            proc = hl86.launch(args.binary, vm, args.roms, sock, unthrottled=True)
+            proc = hl86.launch(
+                args.binary, vm, args.roms, Path(tmp) / "s", unthrottled=True
+            )
             try:
                 try:
-                    with hl86.Client(sock) as c:
-                        text = c.wait_text("^TOPLINE", 60)
-                        self.assertTrue(text.startswith("TOPLINE"))
+                    with hl86.Client(Path(tmp) / "s") as c:
+                        yield c
                 finally:
                     proc.terminate()
                     proc.wait(30)
             finally:
                 bat.write_bytes(orig)
                 hl86.dos_put(vm / "c.img", bat, "AUTOEXEC.BAT")
+
+    def test_text_follows_crtc_start_address(self) -> None:
+        """screen_text once read video memory from offset 0 and missed a scrolled screen."""
+        with self.hanging("crtcstart.com") as c:
+            self.assertTrue(c.wait_text("^TOPLINE", 60).startswith("TOPLINE"))
+
+    def spin_addresses(self, c: hl86.Client) -> tuple[int, int]:
+        out = ""
+        for _ in range(600):
+            out += c.debug_out()
+            if m := re.search(r"LOOP ([0-9A-F]{8}) DATA ([0-9A-F]{8})\n", out):
+                return int(m[1], 16), int(m[2], 16)
+            c.sleep(100)
+        self.fail("spin.com never reported its addresses")
+
+    def test_profile_lands_in_the_spin_loop(self) -> None:
+        """The recorded PC must be CS base + EIP; EIP alone lands at 0x1xx, outside the loop."""
+        with self.hanging("spin.com") as c, tempfile.TemporaryDirectory() as tmp:
+            loop, _ = self.spin_addresses(c)
+            c.profile_start(20)
+            c.sleep(200)
+            path = Path(tmp) / "p.json"
+            r = c.profile_stop(path)
+            data = json.loads(path.read_text())
+            self.assertEqual(data["samples"], r["samples"])
+            self.assertGreater(r["samples"], 8000)  # 200 ms / 20 us = 10000
+            inside = sum(
+                n for pc, n in data["pcs"].items() if loop <= int(pc, 16) < loop + 2
+            )
+            self.assertGreater(inside, 0.9 * data["samples"])
+
+    def test_mem_read_returns_guest_bytes(self) -> None:
+        with self.hanging("spin.com") as c, tempfile.TemporaryDirectory() as tmp:
+            _, data = self.spin_addresses(c)
+            got = c.mem_read(data, 16, Path(tmp) / "m.bin")
+            self.assertEqual(got, b"HL86-MEMREAD-OK\x00")
+
+    def test_profiling_does_not_change_guest_timing(self) -> None:
+        plain = counts(run("qb-p100", "imulshl.com").debug)
+        r = hl86.run_dos(
+            args.binary,
+            Path(args.vms) / "qb-p100",
+            args.roms,
+            EX / "imulshl.com",
+            profile_us=20,
+        )
+        self.assertEqual(counts(r.debug), plain)
 
     def test_imul_costs_several_times_shl(self) -> None:
         """The PIT count wraps every 54.9 ms; a long loop once read as 9 cycles per imul, not 32."""

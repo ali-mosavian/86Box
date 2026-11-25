@@ -40,6 +40,13 @@ void hl_keys_set_delay(int ms);
 void hl_keys_step(void);
 int  hl_keys_idle(void);
 
+/* hl_prof.c */
+void     hl_prof_start(uint32_t interval_us);
+void     hl_prof_reset(void);
+int      hl_prof_active(void);
+int      hl_prof_stop(const char *path, uint64_t *samples, uint32_t *distinct, uint32_t *interval);
+uint8_t *hl_mem_read(uint32_t linear, uint32_t len);
+
 /* hl_ctl.c */
 int  hl_ctl_open(const char *path);
 void hl_ctl_close(void);

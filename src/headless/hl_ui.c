@@ -105,6 +105,7 @@ void
 ui_hard_reset_completed(void)
 {
     hl_ports_register();
+    hl_prof_reset();
 }
 
 char *
