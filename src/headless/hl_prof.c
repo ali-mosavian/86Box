@@ -28,6 +28,7 @@ typedef struct slot_t {
 
 static pc_timer_t timer;
 static int        active;
+static int        counting;
 static int        added;
 static uint32_t   interval_us;
 static uint64_t   total;
@@ -41,6 +42,9 @@ sample(UNUSED(void *priv))
     const uint32_t pc = cpu_use_dynarec ? cpu_exec_start_pc : cpu_state.seg_cs.base + cpu_state.pc;
     uint32_t       h  = (pc * 2654435761u) >> 16;
 
+    timer_advance_u64(&timer, (uint64_t) interval_us * TIMER_USEC);
+    if (!counting)
+        return;
     total++;
     for (unsigned n = 0; n < SLOTS; n++, h++) {
         slot_t *s = &table[h & (SLOTS - 1)];
@@ -51,7 +55,6 @@ sample(UNUSED(void *priv))
         s->count++;
         break;
     }
-    timer_advance_u64(&timer, (uint64_t) interval_us * TIMER_USEC);
 }
 
 static void
@@ -76,11 +79,23 @@ hl_prof_start(uint32_t interval)
     table       = calloc(SLOTS, sizeof(slot_t));
     interval_us = interval ? interval : 20;
     total = dropped = 0;
-    active          = 1;
+    active = counting = 1;
     if (added)
         timer_disable(&timer);
     added = 1;
     arm();
+}
+
+/* The guest's window: open clears the counts so far and counts on; closed counts nothing more, so
+   the host's delay in stopping is not sampled. */
+void
+hl_prof_window(int open)
+{
+    if (open && table) {
+        memset(table, 0, SLOTS * sizeof(slot_t));
+        total = dropped = 0;
+    }
+    counting = open;
 }
 
 int
