@@ -220,6 +220,25 @@ class Headless(unittest.TestCase):
         a, b = self.bench("qb-486", "pmbranch.com")
         self.assertGreater(a - b, 1.5)
 
+    def test_fdiv_overlaps_independent_integer_adds(self) -> None:
+        """fdiv plus 40 adds cost the sum: 197 cycles on a 486 (fdiv alone 77); max(fdiv, adds) is right."""
+        for vm in ("qb-486", "qb-p100"):
+            a, b = self.bench(vm, "pmfdadd.com")
+            with self.subTest(vm=vm):
+                self.assertAlmostEqual(a, b, delta=0.1 * b)
+
+    def test_fdiv_after_fdiv_waits_for_the_divider(self) -> None:
+        """The second fdiv did not wait on a Pentium (42 cycles for two divides, 41 for one)."""
+        for vm in ("qb-486", "qb-p100"):
+            a, b = self.bench(vm, "pmfdfd.com")
+            with self.subTest(vm=vm):
+                self.assertAlmostEqual(a / b, 2.0, delta=0.15)
+
+    def test_486_add_immediate_costs_one_cycle(self) -> None:
+        """add reg,imm used the memory-operand timing: 3 cycles, not 1."""
+        a, b = self.bench("qb-486", "pmaddi.com")
+        self.assertAlmostEqual((a - b) / 16, 0.0, delta=0.3)
+
     def test_boot_skips_cmos_prompt(self) -> None:
         for vm in ("qb-486", "qb-p100", "qb-ppro200"):
             with self.subTest(vm=vm), tempfile.TemporaryDirectory() as tmp:

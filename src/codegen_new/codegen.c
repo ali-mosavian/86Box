@@ -184,6 +184,46 @@ codegen_bp_resolve(uint32_t pc, uint32_t flags)
         cycles -= codegen_bp_taken_cost;
 }
 
+/*
+ * x87 runs concurrently with the integer unit (i486 and Pentium manuals): an
+ * x87 instruction takes its non-concurrent part of the integer timeline and the
+ * FPU stays busy for codegen_fpu_busy more cycles; the next x87 instruction
+ * waits for it. The timing models track that inside a block; this carries it
+ * across blocks, in guest time (tsc plus the block's static offset), so a
+ * divide in one block still delays the next block's first x87 instruction.
+ * The timing model sets codegen_fpu_x87 and codegen_fpu_busy per instruction.
+ */
+int             codegen_fpu_x87;
+int             codegen_fpu_busy;
+static int      fpu_first;
+static uint64_t fpu_free_at;
+
+void
+codegen_fpu_block_start(void)
+{
+    fpu_first = 1;
+}
+
+/* Called before the x87 instruction's own cycles are charged. */
+void
+codegen_fpu_sync(uint32_t own, uint32_t flags)
+{
+    const int busy  = flags & 0xffff;
+    const int first = (flags >> 16) & 1;
+    const int set   = (flags >> 17) & 1;
+    /*Guest time now: the main loop's tsc and cycles at block entry, and the cycles used since*/
+    uint64_t now = cpu_exec_start_tsc + (uint64_t) (int64_t) (cpu_exec_start_cycles - cycles);
+
+    if (first && fpu_free_at > now) {
+        const int wait = (int) MIN(fpu_free_at - now, 4096); /*clamp: a guest write to the TSC must not stall forever*/
+
+        cycles -= wait;
+        now += wait;
+    }
+    if (set && now + own + busy > fpu_free_at)
+        fpu_free_at = now + own + busy;
+}
+
 void
 codegen_timing_set(codegen_timing_t *timing)
 {
@@ -721,7 +761,17 @@ generate_call:
     codegen_instructions[block->ins].TOP       = cpu_state.TOP;
     codegen_instructions[block->ins].first_uop = ir->wr_pos;
 
+    codegen_fpu_x87 = 0;
     codegen_timing_opcode(opcode, fetchdat, op_32, op_pc);
+    /*codegen_fpu_x87: bit 0 the instruction waits for the FPU, bit 1 it leaves the FPU busy*/
+    if ((codegen_fpu_x87 & 2) || ((codegen_fpu_x87 & 1) && fpu_first)) {
+        codegen_accumulate_flush(ir);
+        uop_LOAD_FUNC_ARG_IMM(ir, 0, codegen_block_cycles);
+        uop_LOAD_FUNC_ARG_IMM(ir, 1, (codegen_fpu_busy & 0xffff) | (((codegen_fpu_x87 & 1) && fpu_first) << 16) | (((codegen_fpu_x87 & 2) != 0) << 17));
+        uop_CALL_FUNC(ir, codegen_fpu_sync);
+    }
+    if (codegen_fpu_x87 & 1)
+        fpu_first = 0;
 
     codegen_accumulate(ir, ACCREG_cycles, -codegen_block_cycles);
     codegen_block_cycles = 0;

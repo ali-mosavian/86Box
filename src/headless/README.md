@@ -110,12 +110,15 @@ valid settings.
 - On the 486 and Pentium models a 0x66 operand-size prefix (32-bit code in
   real mode) costs extra cycles; protected-mode 32-bit code does not pay it.
 - The dynarec timing models are calibrated by `examples/pmbench.asm`
-  (flat protected-mode micro-benchmarks, `-DTEST=1..6`, run by `selftest.py`):
-  P6 multiplier latency 4, partial-register and partial-flags stalls,
-  store-forwarding failure, 66h length-changing prefix, 16-byte fetch
-  blocks; a 512-entry BTB of two-bit counters charges mispredicts (P6 12
-  cycles, Pentium 4); the 486 charges base+index addressing and 2 extra
-  cycles per taken jcc. The interpreter (`cpu_use_dynarec=0`) is unchanged.
+  (flat protected-mode micro-benchmarks, `-DTEST=1..10`, run by `selftest.py`).
+  P6: multiplier latency 4, partial-register (5-6 clocks) and partial-flags
+  stalls, store-forward failure (7-8), 66h prefix stalls, 16-byte fetch blocks,
+  and a two-level branch predictor (512-entry BTB, 4-bit local history, 15-cycle
+  mispredict). Pentium: 256 two-bit counters, 4-cycle mispredict. 486: base+index
+  addressing and taken jcc cost extra cycles. On the 486 and Pentium an x87
+  instruction charges only its non-concurrent clocks and leaves the FPU busy;
+  `codegen_fpu_sync` carries that across blocks and the next x87 instruction
+  waits. The interpreter (`cpu_use_dynarec=0`) is unchanged.
 
 ## Checks
 

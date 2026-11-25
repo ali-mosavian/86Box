@@ -683,6 +683,8 @@ extern int      in_sys;
 extern int      unmask_a20_in_smm;
 extern int      cycles_main;
 extern uint32_t cpu_exec_start_pc;
+extern uint64_t cpu_exec_start_tsc;
+extern int32_t  cpu_exec_start_cycles;
 extern uint32_t old_rammask;
 
 #ifdef USE_ACYCS

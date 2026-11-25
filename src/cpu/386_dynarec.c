@@ -255,6 +255,8 @@ fetch_ea_16_long(uint32_t rmdat)
 int32_t         cycles_main = 0;
 /* Linear address where the block being run started; the profiler charges a sample to it. */
 uint32_t        cpu_exec_start_pc;
+uint64_t        cpu_exec_start_tsc;
+int32_t         cpu_exec_start_cycles;
 static int32_t  cycles_old  = 0;
 static uint64_t tsc_old     = 0;
 
@@ -858,7 +860,9 @@ exec386_dynarec(int32_t cycs)
 
             cycdiff = 0;
 #    endif
-            cpu_exec_start_pc = cs + cpu_state.pc;
+            cpu_exec_start_pc     = cs + cpu_state.pc;
+            cpu_exec_start_tsc    = tsc;
+            cpu_exec_start_cycles = cycles;
             oldcyc = oldcyc2 = cycles;
             cycles_old       = cycles;
             oldtsc           = tsc;

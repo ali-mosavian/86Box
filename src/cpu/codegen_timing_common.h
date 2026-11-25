@@ -229,3 +229,16 @@ get_dstdep_mask(uint64_t data, uint32_t fetchdat, int bit8)
 
     return mask;
 }
+
+/*Opcodes after which the code generator may leave the block. fetchdat holds the
+  ModRM byte in its low byte for opcode 0xff.*/
+static inline int
+codegen_timing_leaves_block(uint8_t prefix, uint8_t opcode, uint32_t fetchdat)
+{
+    if (prefix == 0x0f)
+        return opcode >= 0x80 && opcode <= 0x8f;
+    if (prefix == 0xf2 || prefix == 0xf3)
+        return 0;
+    return (opcode & 0xf0) == 0x70 || (opcode & 0xfc) == 0xe0 || opcode == 0xc2 || (opcode & 0xfe) == 0xca
+        || (opcode & 0xfc) == 0xcc || (opcode & 0xfc) == 0xe8 || (opcode == 0xff && (fetchdat & 0x38) >= 0x10 && (fetchdat & 0x38) < 0x30);
+}

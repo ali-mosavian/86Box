@@ -958,6 +958,8 @@ void
 codegen_timing_pentium_block_start(void)
 {
     u_pipe_full = decode_delay = decode_delay_offset = 0;
+    fpu_latency = 0;
+    memset(fpu_st_latency, 0, sizeof(fpu_st_latency));
 }
 
 void
@@ -1034,6 +1036,8 @@ codegen_instruction(uint64_t *timings, uint64_t *deps, uint8_t opcode, uint32_t 
         codegen_fpu_latency_clock(decode_delay + decode_delay_offset + instr_cycles);
     else
         codegen_fpu_latency_clock(instr_cycles);
+    /*The cycles this instruction itself takes run while the FPU goes on with its last instruction*/
+    codegen_fpu_latency_clock(COUNT(timings[opcode], deps[opcode], op_32) + exec_delay);
     instr_cycles += COUNT(timings[opcode], deps[opcode], op_32);
     instr_cycles += exec_delay;
     if ((decode_delay + decode_delay_offset) > 0)
@@ -1086,8 +1090,8 @@ codegen_instruction(uint64_t *timings, uint64_t *deps, uint8_t opcode, uint32_t 
     }
 }
 
-void
-codegen_timing_pentium_opcode(uint8_t opcode, uint32_t fetchdat, int op_32, UNUSED(uint32_t op_pc))
+static void
+pentium_opcode(uint8_t opcode, uint32_t fetchdat, int op_32)
 {
     uint64_t *timings;
     uint64_t *deps;
@@ -1196,6 +1200,13 @@ codegen_timing_pentium_opcode(uint8_t opcode, uint32_t fetchdat, int op_32, UNUS
             }
     }
 
+    /*The FPU takes the next FP instruction FPU_F_LATENCY cycles after an FP instruction's integer-side
+      time (Intel Pentium Processor Family Developer's Manual, FP instruction timings; FDIV 39 clocks,
+      38 overlap integer instructions, the last 2 overlap FP; FXCH excepted). The wait inside a block
+      is modelled here; codegen_fpu_sync carries it across blocks: an FP instruction waits, and a
+      jump leaves what is still running.*/
+    if ((timings[opcode] & PAIR_FPU) && !(deps[opcode] & FPU_FXCH))
+        codegen_fpu_x87 = 1;
     if (u_pipe_full) {
         uint8_t regmask = get_srcdep_mask(deps[opcode], fetchdat, bit8, u_pipe_op_32);
 
@@ -1307,6 +1318,19 @@ nopair:
 }
 
 void
+codegen_timing_pentium_opcode(uint8_t opcode, uint32_t fetchdat, int op_32, UNUSED(uint32_t op_pc))
+{
+    const uint8_t prefix = last_prefix;
+
+    pentium_opcode(opcode, fetchdat, op_32);
+    /*A jump leaves whatever the FPU is still running to the next block*/
+    if (fpu_latency > 0 && codegen_timing_leaves_block(prefix, opcode, fetchdat)) {
+        codegen_fpu_x87  = 2;
+        codegen_fpu_busy = fpu_latency;
+    }
+}
+
+void
 codegen_timing_pentium_block_end(void)
 {
     if (u_pipe_full) {
@@ -1315,6 +1339,10 @@ codegen_timing_pentium_block_end(void)
             codegen_block_cycles++;
         codegen_block_cycles += COUNT(u_pipe_timings[u_pipe_opcode], u_pipe_deps[u_pipe_opcode], u_pipe_op_32) + decode_delay + decode_delay_offset;
         u_pipe_full = 0;
+    }
+    if (fpu_latency > 0) {
+        codegen_fpu_x87  = 2;
+        codegen_fpu_busy = fpu_latency;
     }
 }
 

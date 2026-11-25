@@ -588,6 +588,7 @@ codegen_block_start_recompile(codeblock_t *block)
 
     codegen_block_cycles = 0;
     codegen_timing_block_start();
+    codegen_fpu_block_start();
 
     codegen_block_ins      = 0;
     codegen_block_full_ins = 0;
@@ -773,7 +774,14 @@ codegen_block_end(void)
 void
 codegen_block_end_recompile(codeblock_t *block)
 {
+    codegen_fpu_x87 = 0;
     codegen_timing_block_end();
+    if (codegen_fpu_x87 & 2) {
+        codegen_accumulate_flush(ir_data);
+        uop_LOAD_FUNC_ARG_IMM(ir_data, 0, codegen_block_cycles);
+        uop_LOAD_FUNC_ARG_IMM(ir_data, 1, (codegen_fpu_busy & 0xffff) | (1 << 17));
+        uop_CALL_FUNC(ir_data, codegen_fpu_sync);
+    }
     codegen_accumulate(ir_data, ACCREG_cycles, -codegen_block_cycles);
 
     if (block->flags & CODEBLOCK_IN_DIRTY_LIST)
