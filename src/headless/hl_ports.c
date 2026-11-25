@@ -65,7 +65,7 @@ hl_debug_take(char **buf)
 {
     const size_t n = dbg_len;
 
-    *buf    = dbg_buf;
+    *buf    = dbg_buf ? dbg_buf : calloc(1, 1);
     dbg_buf = NULL;
     dbg_len = dbg_cap = 0;
     return n;
