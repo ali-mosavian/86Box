@@ -71,6 +71,7 @@ the smallest user of both ports.
 
 ```python
 import hl86
+
 proc = hl86.launch("build/src/86Box-headless", vm, roms, "/tmp/vm.sock")
 with hl86.Client("/tmp/vm.sock") as c:
     c.wait_text(r"C:.>")

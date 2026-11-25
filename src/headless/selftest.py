@@ -54,13 +54,14 @@ class Headless(unittest.TestCase):
             sock = Path(tmp) / "s"
             proc = hl86.launch(args.binary, vm, args.roms, sock, unthrottled=True)
             try:
-                with hl86.Client(sock) as c:
-                    text = c.wait_text("^TOPLINE", 60)
-                    self.assertTrue(text.startswith("TOPLINE"))
-                    c.quit()
+                try:
+                    with hl86.Client(sock) as c:
+                        text = c.wait_text("^TOPLINE", 60)
+                        self.assertTrue(text.startswith("TOPLINE"))
+                finally:
+                    proc.terminate()
+                    proc.wait(30)
             finally:
-                proc.terminate()
-                proc.wait(30)
                 bat.write_bytes(orig)
                 hl86.dos_put(vm / "c.img", bat, "AUTOEXEC.BAT")
 
