@@ -170,7 +170,8 @@ hl_screen_text(int *is_text, int *mode, int *cols, int *rows, int *cx, int *cy)
     const int ncols  = peek(0x44a) | (peek(0x44b) << 8);
     int       nrows  = peek(0x484) + 1;
     const int page   = peek(0x462);
-    const int start  = peek(0x44e) | (peek(0x44f) << 8);
+    /* The CRTC start address is what the card shows; the BIOS copy can lag behind it. */
+    const int start  = svga ? ((svga->crtc[0x0c] << 8) | svga->crtc[0x0d]) * 2 : peek(0x44e) | (peek(0x44f) << 8);
     const int cpos   = peek(0x450 + page * 2) | (peek(0x451 + page * 2) << 8);
     const int text   = (bmode <= 3 || bmode == 7) && !(svga && (svga->attrregs[0x10] & 1));
     uint32_t  base   = (bmode == 7) ? 0xb0000 : 0xb8000;
