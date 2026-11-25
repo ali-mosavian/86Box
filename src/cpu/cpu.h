@@ -725,6 +725,7 @@ extern int timing_misaligned;
 extern int      in_sys;
 extern int      unmask_a20_in_smm;
 extern int      cycles_main;
+extern uint32_t cpu_exec_start_pc;
 extern uint32_t old_rammask;
 
 extern int pic_pending;

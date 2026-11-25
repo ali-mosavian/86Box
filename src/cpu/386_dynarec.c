@@ -340,6 +340,8 @@ dr_blocks_cache(void)
 #define CACHE_ON()        CACHE_ON_DBG(cpu_debug_regs_486)
 
 int32_t         cycles_main = 0;
+/* Linear address where the block that ran last started; the profiler charges a sample to it. */
+uint32_t        cpu_exec_start_pc;
 #    ifdef CODEGEN_BACKEND_HAS_BLOCK_LINK
 /* The block link routine does the loop-top stores itself. */
 int32_t  cycles_old = 0;
@@ -977,9 +979,12 @@ exec386_dynarec_dyn(const int dbg)
         inrecomp = 1;
 #    ifdef CODEGEN_BACKEND_HAS_BLOCK_LINK
         /* A block compiled without links returns nothing. */
-        if (link)
+        if (link) {
             link_from = code();
-        else
+            /* Linked blocks ran on from this one: the slot is the last one's exit. */
+            if (link_from != NULL)
+                cpu_exec_start_pc = codeblock[((uintptr_t) link_from - (uintptr_t) codegen_link_slots) / sizeof(codegen_link_slot_t) / CODEGEN_LINK_SLOTS].pc;
+        } else
             code();
 #    else
         code();
@@ -1371,6 +1376,7 @@ exec386_dynarec_common(int32_t cycs, const int dbg)
             cycles_old       = cycles;
             oldtsc           = tsc;
             tsc_old          = tsc;
+            cpu_exec_start_pc = cs + cpu_state.pc;
             if (cpu_force_interpreter || cpu_override_dynarec || cpu_flush_pending || (!CACHE_ON_DBG(dbg))) /*Interpret block*/
             {
 #    ifdef CODEGEN_BACKEND_HAS_BLOCK_LINK
