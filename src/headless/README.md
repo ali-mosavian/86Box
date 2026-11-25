@@ -50,10 +50,20 @@ One JSON object per line, one reply per request, `{"ok": true, ...}` or
 | `pause`, `resume` | | |
 | `reset` | | hard reset |
 | `debug_out` | | `data`, `bytes`: what the guest wrote to port 0xE9 since the last call; also echoed to stderr |
+| `profile_start` | `interval_us` (emulated, default 20) | start sampling the guest PC |
+| `profile_stop` | `path` | writes `{"interval_us", "samples", "pcs": {"<hex linear pc>": count}}` to `path`; replies with `interval_us`, `samples`, `distinct` |
+| `mem_read` | `addr` (linear), `len` (up to 16 MB), `path` | writes the raw bytes to `path` (paging walked if on; error on an unmapped page) |
 | `quit` | `code` (default 0) | then exits |
 
 When the run ends, every connected client gets
 `{"event": "exit", "code": N, "emu_ms": ..., "data": "<unread 0xE9 bytes>"}`.
+
+Samples are the linear PC (CS base + EIP) and come from a timer in 86Box's
+timer system, so guest timing is unchanged (`selftest.py` checks that
+`imulshl.com` counts are identical with sampling on). With the dynarec the
+sample is the PC at the next block boundary; set `cpu_use_dynarec = 0` for
+exact instruction PCs. A hard reset keeps sampling. Wall-clock cost: none
+measurable at 20 us, about 2x at 5 us.
 
 ## Guest ports
 
@@ -79,6 +89,8 @@ with hl86.Client("/tmp/vm.sock") as c:
     print(c.screen_text())
     c.quit()
 ```
+
+Profile with `c.profile_start(20)` ... `c.profile_stop(path)`; read memory with `c.mem_read(addr, n, path)`.
 
 Run a DOS program and collect its port 0xE9 output (needs mtools; the program
 is copied to the image root, AUTOEXEC.BAT is swapped for the run and restored):

@@ -318,6 +318,51 @@ handle_line(client_t *c, const char *line)
         reply(c->fd, ok_obj());
     } else if (!strcmp(cmd, "debug_out")) {
         cmd_debug_out(c->fd);
+    } else if (!strcmp(cmd, "profile_start")) {
+        hl_prof_start((uint32_t) num_arg(req, "interval_us", 20));
+        reply(c->fd, ok_obj());
+    } else if (!strcmp(cmd, "profile_stop")) {
+        const char *path = str_arg(req, "path");
+        uint64_t    n;
+        uint32_t    distinct, iv;
+
+        if (!path || !hl_prof_active()) {
+            reply_error(c->fd, path ? "profiler not running" : "path required");
+        } else if (hl_prof_stop(path, &n, &distinct, &iv)) {
+            reply_error(c->fd, "cannot write file");
+        } else {
+            cJSON *o = ok_obj();
+
+            cJSON_AddNumberToObject(o, "interval_us", iv);
+            cJSON_AddNumberToObject(o, "samples", (double) n);
+            cJSON_AddNumberToObject(o, "distinct", distinct);
+            reply(c->fd, o);
+        }
+    } else if (!strcmp(cmd, "mem_read")) {
+        const char *path = str_arg(req, "path");
+        double      addr = num_arg(req, "addr", -1), len = num_arg(req, "len", -1);
+
+        if (!path || addr < 0 || addr > 4294967295.0 || len < 0 || len > (16 << 20)) {
+            reply_error(c->fd, "need path, addr (0..4G) and len (0..16M)");
+        } else {
+            uint8_t *buf = hl_mem_read((uint32_t) addr, (uint32_t) len);
+            FILE    *fp  = buf ? fopen(path, "wb") : NULL;
+
+            if (!buf) {
+                reply_error(c->fd, "unmapped address");
+            } else if (!fp || fwrite(buf, 1, (size_t) len, fp) != (size_t) len) {
+                reply_error(c->fd, "cannot write file");
+                if (fp)
+                    fclose(fp);
+            } else {
+                cJSON *o = ok_obj();
+
+                fclose(fp);
+                cJSON_AddNumberToObject(o, "len", len);
+                reply(c->fd, o);
+            }
+            free(buf);
+        }
     } else if (!strcmp(cmd, "quit")) {
         reply(c->fd, ok_obj());
         hl_request_quit((int) num_arg(req, "code", 0));

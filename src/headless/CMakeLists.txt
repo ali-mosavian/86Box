@@ -10,6 +10,7 @@ add_library(plat OBJECT
     hl_keys.c
     hl_video.c
     hl_ctl.c
+    hl_prof.c
     hl_joystick.c
     ../unix/unix_netsocket.c
     ../unix/unix_dynld.c
