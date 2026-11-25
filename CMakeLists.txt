@@ -19,6 +19,13 @@ cmake_minimum_required(VERSION 3.16)
 cmake_policy(SET CMP0091 NEW)
 cmake_policy(SET CMP0079 NEW)
 
+if(HEADLESS)
+    set(QT OFF)
+    set(OPENAL OFF)
+    set(RTMIDI OFF)
+    set(DISCORD OFF)
+endif()
+
 if(HAIKU)
     set(OPENAL ON)
 endif()
@@ -140,6 +147,7 @@ option(DISCORD      "Discord Rich Presence support"                             
 option(DEBUGREGS486 "Enable debug register opeartion on 486+ CPUs"               OFF)
 option(LIBASAN      "Enable compilation with the addresss sanitizer"             OFF)
 option(QT           "Use the Qt-based user interface"                            ON)
+option(HEADLESS     "Windowless build driven over a unix socket"                 OFF)
 
 if((ARCH STREQUAL "arm64"))
     set(NEW_DYNAREC ON)

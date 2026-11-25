@@ -68,7 +68,9 @@ add_library(snd OBJECT
 )
 
 # TODO: Should platform-specific audio driver be here?
-if(AUDIO4)
+if(HEADLESS)
+    target_sources(snd PRIVATE ../headless/hl_audio.c)
+elseif(AUDIO4)
     target_sources(snd PRIVATE audio4.c)
 elseif(SNDIO)
     target_sources(snd PRIVATE sndio.c)
