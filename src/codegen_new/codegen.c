@@ -69,44 +69,117 @@ void (*codegen_timing_block_end)(void);
 int (*codegen_timing_jump_cycles)(void);
 
 /*
- * Branch prediction: a direct-mapped BTB of two-bit counters keyed by the branch
- * address. A branch missing from the BTB is predicted by the static rule
- * (backward taken, forward not taken). A wrong prediction costs
- * codegen_bp_penalty cycles; zero turns the model off.
- * Penalties: P6 about 12 (Intel P6 optimization manual: 10-15), P5 4
- * (Pentium: 3-4, Agner Fog microarchitecture).
+ * Branch prediction.
+ *
+ * P6 (Agner Fog, "The microarchitecture of Intel, AMD and VIA CPUs", PPro/P2/P3
+ * branch prediction): 512-entry BTB, 16 ways * 32 sets, set = address bits 4-8,
+ * entry allocated on first execution. Each entry is a two-level adaptive
+ * predictor: a 4-bit local history picks one of 16 two-bit saturating
+ * counters, so any repeating pattern of period 5 or less is predicted
+ * perfectly. A misprediction "usually costs between 10 and 20 clock cycles";
+ * 15 is used. A branch missing from the BTB is predicted by the static rule
+ * (backward taken, forward not taken).
+ *
+ * P5: 256 entries of one two-bit counter, direct mapped, 4 cycle mispredict
+ * (Agner Fog: 4 clocks in the U-pipe, 5 in the V-pipe).
+ *
+ * codegen_bp_penalty of zero turns prediction off.
  */
-#define BTB_ENTRIES 512
+#define P6_BTB_SETS 32
+#define P6_BTB_WAYS 16
+#define P5_BTB_ENTRIES 256
+#define P6_MISPREDICT 15
+#define P5_MISPREDICT 4
+
 int codegen_bp_penalty;
 int codegen_bp_taken_cost; /* 486: a taken jcc costs 3 cycles, not 1 (i486 manual) */
+static int bp_two_level;
+
+static struct {
+    uint32_t pc;
+    uint32_t used; /*LRU stamp*/
+    uint8_t  valid;
+    uint8_t  history;
+    uint8_t  counter[16];
+} p6_btb[P6_BTB_SETS][P6_BTB_WAYS];
+static uint32_t p6_btb_clock;
+
 static struct {
     uint32_t pc;
     uint8_t  valid;
     uint8_t  counter;
-} btb[BTB_ENTRIES];
+} p5_btb[P5_BTB_ENTRIES];
+
+static int
+bp_predict_p6(uint32_t pc, int taken, int backward)
+{
+    const int set = (pc >> 4) & (P6_BTB_SETS - 1);
+    int       way, victim = 0;
+
+    for (way = 0; way < P6_BTB_WAYS; way++) {
+        if (p6_btb[set][way].valid && p6_btb[set][way].pc == pc) {
+            uint8_t *c        = &p6_btb[set][way].counter[p6_btb[set][way].history];
+            const int predicted = *c >= 2;
+
+            if (taken && *c < 3)
+                (*c)++;
+            else if (!taken && *c > 0)
+                (*c)--;
+            p6_btb[set][way].history = ((p6_btb[set][way].history << 1) | taken) & 15;
+            p6_btb[set][way].used    = ++p6_btb_clock;
+            return predicted;
+        }
+    }
+    for (way = 0; way < P6_BTB_WAYS; way++) {
+        if (!p6_btb[set][way].valid) {
+            victim = way;
+            break;
+        }
+        if (p6_btb[set][way].used < p6_btb[set][victim].used)
+            victim = way;
+    }
+    memset(&p6_btb[set][victim], 0, sizeof(p6_btb[set][victim]));
+    p6_btb[set][victim].valid   = 1;
+    p6_btb[set][victim].pc      = pc;
+    p6_btb[set][victim].used    = ++p6_btb_clock;
+    p6_btb[set][victim].history = taken;
+    memset(p6_btb[set][victim].counter, 1, sizeof(p6_btb[set][victim].counter));
+    return backward;
+}
+
+static int
+bp_predict_p5(uint32_t pc, int taken, int backward)
+{
+    const int slot = (pc ^ (pc >> 8)) & (P5_BTB_ENTRIES - 1);
+    int       predicted;
+
+    if (p5_btb[slot].valid && p5_btb[slot].pc == pc) {
+        predicted = p5_btb[slot].counter >= 2;
+        if (taken && p5_btb[slot].counter < 3)
+            p5_btb[slot].counter++;
+        else if (!taken && p5_btb[slot].counter > 0)
+            p5_btb[slot].counter--;
+    } else {
+        predicted              = backward;
+        p5_btb[slot].valid     = 1;
+        p5_btb[slot].pc        = pc;
+        p5_btb[slot].counter   = taken ? 2 : 1;
+    }
+    return predicted;
+}
 
 void
 codegen_bp_resolve(uint32_t pc, uint32_t flags)
 {
     const int taken    = flags & 1;
     const int backward = (flags >> 1) & 1;
-    const int slot     = (pc ^ (pc >> 9)) & (BTB_ENTRIES - 1);
-    int       predicted;
 
-    if (btb[slot].valid && btb[slot].pc == pc) {
-        predicted = btb[slot].counter >= 2;
-        if (taken && btb[slot].counter < 3)
-            btb[slot].counter++;
-        else if (!taken && btb[slot].counter > 0)
-            btb[slot].counter--;
-    } else {
-        predicted = backward;
-        btb[slot].valid   = 1;
-        btb[slot].pc      = pc;
-        btb[slot].counter = taken ? 2 : 1;
+    if (codegen_bp_penalty) {
+        const int predicted = bp_two_level ? bp_predict_p6(pc, taken, backward) : bp_predict_p5(pc, taken, backward);
+
+        if (predicted != taken)
+            cycles -= codegen_bp_penalty;
     }
-    if (codegen_bp_penalty && predicted != taken)
-        cycles -= codegen_bp_penalty;
     if (taken)
         cycles -= codegen_bp_taken_cost;
 }
@@ -114,9 +187,11 @@ codegen_bp_resolve(uint32_t pc, uint32_t flags)
 void
 codegen_timing_set(codegen_timing_t *timing)
 {
-    codegen_bp_penalty = (timing == &codegen_timing_p6) ? 12 : (timing == &codegen_timing_pentium) ? 4 : 0;
+    codegen_bp_penalty = (timing == &codegen_timing_p6) ? P6_MISPREDICT : (timing == &codegen_timing_pentium) ? P5_MISPREDICT : 0;
+    bp_two_level = timing == &codegen_timing_p6;
     codegen_bp_taken_cost = (timing == &codegen_timing_486) ? 2 : 0;
-    memset(btb, 0, sizeof(btb));
+    memset(p6_btb, 0, sizeof(p6_btb));
+    memset(p5_btb, 0, sizeof(p5_btb));
     codegen_timing_start       = timing->start;
     codegen_timing_prefix      = timing->prefix;
     codegen_timing_opcode      = timing->opcode;

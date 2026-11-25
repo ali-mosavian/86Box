@@ -10,6 +10,9 @@
 ;   4  A: alternating jz                 B: always-taken jz          (4 branches)
 ;   5  A: mov esi,ebx ; mov eax,[esi] ; add     B: add placed between  (4x)
 ;   6  A: mov eax,[esi+edi]   B: mov eax,[esi]  (8x)
+;   7  A: jz on an xorshift bit   B: jz never taken
+;   8  A: fdiv + 40 independent adds   B: fdiv alone
+;   9  A: fdiv ; fdiv   B: fdiv alone
 ;   nasm -f bin -DTEST=1 pmbench.asm -o pmimul.com
         org     0x100
         bits    16
@@ -82,6 +85,12 @@ pm:     mov     ax, 0x10
         mov     esi, buf
         xor     eax, eax
         mov     edx, 1
+        mov     edi, 1
+%if TEST >= 8
+        fninit
+        fld1
+        fld1
+%endif
 %endmacro
 
 %if TEST = 1
@@ -116,14 +125,14 @@ pm:     mov     ax, 0x10
         %rep 4
         mov     [esi], ebx
         movzx   eax, word [esi + 2]
-        add     edx, eax
+        add     ebx, eax
         %endrep
 %endmacro
 %macro  BODY_B 0
         %rep 4
         mov     [esi], ebx
         mov     eax, [esi]
-        add     edx, eax
+        add     ebx, eax
         %endrep
 %endmacro
 %elif TEST = 4
@@ -168,20 +177,71 @@ pm:     mov     ax, 0x10
 %endmacro
 %elif TEST = 6
 %macro  BODY_A 0
+        xor     edi, edi
         %rep 8
         mov     eax, [esi + edi]
         %endrep
 %endmacro
 %macro  BODY_B 0
+        xor     edi, edi
         %rep 8
         mov     eax, [esi]
         %endrep
+%endmacro
+%elif TEST = 7
+%macro  XORSHIFT 0
+        mov     eax, edi
+        shl     eax, 13
+        xor     edi, eax
+        mov     eax, edi
+        shr     eax, 17
+        xor     edi, eax
+        mov     eax, edi
+        shl     eax, 5
+        xor     edi, eax
+%endmacro
+%macro  BODY_A 0
+        XORSHIFT
+        test    edi, 1
+        jz      %%s
+        nop
+%%s:
+%endmacro
+%macro  BODY_B 0
+        XORSHIFT
+        test    ebx, ebx
+        jz      %%s
+        nop
+%%s:
+%endmacro
+%elif TEST = 8
+%macro  ADDS 0
+        %rep 10
+        add     eax, 1
+        add     ebx, 1
+        add     edx, 1
+        add     edi, 1
+        %endrep
+%endmacro
+%macro  BODY_A 0
+        fdiv    st0, st1
+        ADDS
+%endmacro
+%macro  BODY_B 0
+        fdiv    st0, st1
+%endmacro
+%elif TEST = 9
+%macro  BODY_A 0
+        fdiv    st0, st1
+        fdiv    st0, st1
+%endmacro
+%macro  BODY_B 0
+        fdiv    st0, st1
 %endmacro
 %endif
 
 measure:
         SETUP
-        xor     edi, edi
         mov     ecx, N
         CLOCK
         mov     [t0], eax
@@ -193,7 +253,6 @@ measure:
         sub     eax, [t0]
         mov     [res_a], eax
         SETUP
-        xor     edi, edi
         mov     ecx, N
         CLOCK
         mov     [t0], eax
