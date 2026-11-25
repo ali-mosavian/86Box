@@ -19,6 +19,13 @@ cmake_minimum_required(VERSION 3.16)
 cmake_policy(SET CMP0091 NEW)
 cmake_policy(SET CMP0079 NEW)
 
+if(HEADLESS)
+    set(QT OFF)
+    set(OPENAL OFF)
+    set(RTMIDI OFF)
+    set(DISCORD OFF)
+endif()
+
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 set(CMAKE_C_STANDARD 11)
@@ -172,6 +179,7 @@ option(QT           "Use the Qt-based user interface"                           
 option(SDL2         "Use SDL2 instead of SDL3"                                   OFF)
 option(BUILD_TESTING "Build the unit test suite"                                  OFF)
 option(BUILD_BENCHMARKS "Build performance benchmarks"                            OFF)
+option(HEADLESS     "Windowless build driven over a unix socket"                 OFF)
 
 option(POWERVR_PCX_DEV "PowerVR PCX: developer/test settings in the device" OFF)
 option(ENABLE_VORTEX2_LOG "Enable Aureal Vortex 2 logging"                  OFF)

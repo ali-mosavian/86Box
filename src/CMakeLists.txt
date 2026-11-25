@@ -374,7 +374,10 @@ endif()
 
 add_subdirectory(osd)
 
-if (QT)
+if (HEADLESS)
+    add_compile_definitions(USE_SDL_UI)
+    add_subdirectory(headless)
+elseif (QT)
     add_subdirectory(qt)
 else()
     add_compile_definitions(USE_SDL_UI)
