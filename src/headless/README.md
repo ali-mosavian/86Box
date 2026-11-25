@@ -71,8 +71,9 @@ measurable at 20 us, about 2x at 5 us.
 |---|---|
 | `0xE9` | Bochs debug port: bytes are kept for `debug_out` and echoed to stderr |
 | `0x0501` | exit port: write a byte (`out dx, al`) to end the run; the byte is the process exit code |
+| `0x0502` | profile window: 1 restarts the counts, 0 stops counting, so the host's delay in stopping is not sampled |
 
-`examples/hlexit.asm` is `HLEXIT n` for batch files. `examples/hello.asm` is
+`examples/hlexit.asm` is `HLEXIT n` and `examples/hlprof.asm` `HLPROF n` for batch files. `examples/hello.asm` is
 the smallest user of both ports.
 
 ## Python client

@@ -4,6 +4,7 @@
  *   0x00E9  Bochs debug port: every byte written is kept for debug_out and
  *           echoed to stderr.
  *   0x0501  Exit port: writing a byte ends the run with that exit status.
+ *   0x0502  Profile window: 1 restarts the counts, 0 stops counting.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,11 +53,18 @@ exit_write_l(UNUSED(uint16_t port), uint32_t val, UNUSED(void *priv))
     hl_request_quit(val & 0xff);
 }
 
+static void
+prof_write(UNUSED(uint16_t port), uint8_t val, UNUSED(void *priv))
+{
+    hl_prof_window(val != 0);
+}
+
 void
 hl_ports_register(void)
 {
     io_sethandler(HL_DEBUG_PORT, 1, NULL, NULL, NULL, debug_write, NULL, NULL, NULL);
     io_sethandler(HL_EXIT_PORT, 1, NULL, NULL, NULL, exit_write, exit_write_w, exit_write_l, NULL);
+    io_sethandler(HL_PROF_PORT, 1, NULL, NULL, NULL, prof_write, NULL, NULL, NULL);
 }
 
 /* Hands the collected bytes to the caller (who frees them) and clears them. */

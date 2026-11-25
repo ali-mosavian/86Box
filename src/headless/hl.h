@@ -11,6 +11,7 @@
 #include <stdint.h>
 
 #define HL_EXIT_PORT  0x0501 /* guest writes a status byte here to end the run */
+#define HL_PROF_PORT  0x0502 /* guest writes 1 to restart the profile's counts, 0 to stop counting */
 #define HL_DEBUG_PORT 0x00E9 /* Bochs debug port, collected for debug_out */
 
 uint64_t hl_now_ns(void);
@@ -44,6 +45,7 @@ int  hl_keys_idle(void);
 void     hl_prof_start(uint32_t interval_us);
 void     hl_prof_reset(void);
 int      hl_prof_active(void);
+void     hl_prof_window(int open);
 int      hl_prof_stop(const char *path, uint64_t *samples, uint32_t *distinct, uint32_t *interval);
 uint8_t *hl_mem_read(uint32_t linear, uint32_t len);
 
