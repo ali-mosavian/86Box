@@ -1,6 +1,7 @@
 /*Basic P6 timing model by plant/nerd73. Based on the K6 timing model*/
 /*Some cycle timings come from https://www.agner.org/optimize/instruction_tables.pdf*/
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
 #include <wchar.h>
@@ -639,21 +640,22 @@ static const macro_op_t mov_seg_reg_op = {
     .decode_type = DECODE_COMPLEX,
     .uop[0]      = {.type = UOP_ALU, .latency = 3}
 };
+/*Integer multiply: latency 4, throughput 1 on port 0 (Intel P6 optimization manual; Agner Fog, instruction_tables, PPro IMUL)*/
 static const macro_op_t mul_op = {
     .nr_uops     = 1,
     .decode_type = DECODE_SIMPLE,
-    .uop[0]      = {.type = UOP_ALUP0, .latency = 1}
+    .uop[0]      = {.type = UOP_ALUP0, .latency = 4}
 };
 static const macro_op_t mul_mem_op = {
     .nr_uops     = 2,
     .decode_type = DECODE_COMPLEX,
     .uop[0]      = {.type = UOP_LOAD,   .latency = 1},
-    .uop[1]      = { .type = UOP_ALUP0, .latency = 1}
+    .uop[1]      = { .type = UOP_ALUP0, .latency = 4}
 };
 static const macro_op_t mul64_op = {
     .nr_uops     = 3,
     .decode_type = DECODE_COMPLEX,
-    .uop[0]      = {.type = UOP_ALUP0,  .latency = 1},
+    .uop[0]      = {.type = UOP_ALUP0,  .latency = 4},
     .uop[1]      = { .type = UOP_ALUP0, .latency = 1},
     .uop[2]      = { .type = UOP_ALUP0, .latency = 1}
 };
@@ -661,7 +663,7 @@ static const macro_op_t mul64_mem_op = {
     .nr_uops     = 4,
     .decode_type = DECODE_COMPLEX,
     .uop[0]      = {.type = UOP_LOAD,   .latency = 1},
-    .uop[1]      = { .type = UOP_ALUP0, .latency = 1},
+    .uop[1]      = { .type = UOP_ALUP0, .latency = 4},
     .uop[2]      = { .type = UOP_ALUP0, .latency = 1},
     .uop[3]      = { .type = UOP_ALUP0, .latency = 1}
 };
@@ -1509,13 +1511,50 @@ static const macro_op_t *opcode_timings_p6_df_mod3[8] = {
 
 static uint8_t last_prefix;
 static int     prefixes;
+static int     saw_66;
+
+/*
+ * Timing model overview.
+ *
+ * Instructions are decoded 4-1-1 (one complex plus two simple decoders per
+ * cycle). Each uop is scheduled on an execution port the moment its macro-op is
+ * decoded: it starts when the decode cycle has been reached, the previous uop of
+ * the same instruction has finished, and its source registers (and flags) are
+ * ready. A port is occupied for the uop's throughput (one cycle, or the whole
+ * latency for unpipelined units such as the dividers), not for its latency.
+ * Retirement is in order, three uops a cycle.
+ *
+ * Numbers follow the Intel P6 Family optimization manual (AP-526 / 248966) and
+ * Agner Fog's instruction_tables.pdf and microarchitecture.pdf:
+ *   - IMUL latency 4, throughput 1; L1 load-to-use latency 3.
+ *   - Partial register stall: reading a wider register after a narrower write
+ *     stalls the front end until the write retires (5-7 cycles on a one-cycle
+ *     producer). XOR/SUB reg,reg before the narrow write avoids it; MOVZX/MOVSX
+ *     write the whole register and never stall.
+ *   - Partial flags stall: INC/DEC leave CF alone; a later instruction that
+ *     reads CF together with other flags (JBE/JA, SETBE, PUSHF, LAHF) stalls.
+ *   - Store forwarding: a load forwards from a store only if it starts at the
+ *     same address and is not wider; otherwise it waits for the store to retire.
+ *   - Length-changing prefix: a 66h prefix on an instruction with a 16-bit
+ *     immediate costs about six decode cycles.
+ *   - Decode works on 16-byte fetch blocks.
+ */
+#define LOAD_LATENCY          3
+#define PARTIAL_RETIRE 6
+#define STORE_FWD_FAIL 10
+#define LCP_STALL             6
+#define UNPIPELINED_THRESHOLD 6 /*uops this slow occupy their unit for the whole latency*/
 
 static int decode_timestamp;
 static int last_complete_timestamp;
+static int group_done; /*latest completion in the current decode group*/
+static int group_ins;  /*instructions in the current decode group*/
+static int fetch_block;
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
 
 typedef struct p6_unit_t {
     uint32_t uop_mask;
-    double   first_available_cycle;
+    int      first_available_cycle;
 } p6_unit_t;
 
 static int        nr_units;
@@ -1544,16 +1583,25 @@ static p6_unit_t p2_units[] = {
 #define NR_P2_UNITS (sizeof(p2_units) / sizeof(p6_unit_t))
 
 static int
-uop_run(const p6_uop_t *uop, int decode_time)
+uop_latency(const p6_uop_t *uop)
+{
+    if (uop->type == UOP_LOAD && uop->latency < LOAD_LATENCY)
+        return LOAD_LATENCY;
+    return uop->latency;
+}
+
+/*Runs one uop no earlier than ready_time; returns its completion time*/
+static int
+uop_run(const p6_uop_t *uop, int ready_time)
 {
     p6_unit_t *best_unit        = NULL;
     int        best_start_cycle = 99999;
+    int        latency          = uop_latency(uop);
 
     /*UOP_FXCH does not require execution*/
     if (uop->type == UOP_FXCH)
-        return decode_time;
+        return ready_time;
 
-    /*Find execution unit for this uOP*/
     for (int c = 0; c < nr_units; c++) {
         if (units[c].uop_mask & (1 << uop->type)) {
             if (units[c].first_available_cycle < best_start_cycle) {
@@ -1565,25 +1613,12 @@ uop_run(const p6_uop_t *uop, int decode_time)
     if (!best_unit)
         fatal("uop_run: can not find execution unit\n");
 
-    if (best_start_cycle < decode_time)
-        best_start_cycle = decode_time;
-    best_unit->first_available_cycle = best_start_cycle + uop->latency;
+    if (best_start_cycle < ready_time)
+        best_start_cycle = ready_time;
+    best_unit->first_available_cycle = best_start_cycle + ((latency >= UNPIPELINED_THRESHOLD) ? latency : 1);
 
-    return best_start_cycle + uop->latency;
+    return best_start_cycle + latency;
 }
-
-/*The P6 decoders can decode, per clock :
-  - 1 to 3 'simple' instructions, each up to 1 uOP and 7 bytes long
-  - 1 'complex' instruction, up to 4 uOPs or 3 per cycle for instructions longer than 4 uOPs
-*/
-static struct {
-    int             nr_uops;
-    const p6_uop_t *uops[6];
-    /*Earliest time a uop can start. If the timestamp is -1, then the uop is
-      part of a dependency chain and the start time is the completion time of
-      the previous uop*/
-    int earliest_start[6];
-} decode_buffer;
 
 #define NR_OPSEQS 3
 /*Timestamps of when the last three op sequences completed. Technically this is incorrect,
@@ -1592,47 +1627,49 @@ static int opseq_completion_timestamp[NR_OPSEQS];
 static int next_opseq = 0;
 
 #define NR_REGS 8
-/*Timestamp of when last operation on an integer register completed*/
-static int reg_available_timestamp[NR_REGS];
+/*Per integer register: when the value is ready, the width of the last partial write
+  (0 = whole register), when that write retires, and whether a zeroing idiom made the
+  upper bits known*/
+static int     reg_ready[NR_REGS];
+static int     reg_partial_bits[NR_REGS];
+static int     reg_partial_retire[NR_REGS];
+static uint8_t reg_zero_upper;
+static int     reg_write_seq[NR_REGS];
+/*When the flags are ready, and when a partial-flags writer retires*/
+static int flags_ready;
+static int flags_partial_retire;
 /*Timestamp of when last operation on an FPU register completed*/
 static int fpu_st_timestamp[8];
-/*Completion time of the last uop to be processed. Used to calculate timing of
-  dependent uop chains*/
-static int last_uop_timestamp = 0;
+
+/*Recent integer stores in this block, for store forwarding*/
+#define NR_STORES 8
+typedef struct store_t {
+    int     valid;
+    uint8_t modrm_key; /*mod/rm and SIB of the address*/
+    uint8_t sib;
+    int     disp;
+    int     size;
+    int     data_ready;
+    int     retire;
+    int     seq_base, seq_index;
+} store_t;
+static store_t stores[NR_STORES];
+static int     next_store;
 
 void
 decode_flush_p6(void)
 {
-    int start_timestamp;
-    int uop_timestamp = 0;
-
     /*Decoded opseq can not be submitted if there are no free spaces in the
       opseq buffer*/
     if (decode_timestamp < opseq_completion_timestamp[next_opseq])
         decode_timestamp = opseq_completion_timestamp[next_opseq];
 
-    /*Ensure that uops can not be submitted before they have been decoded*/
-    if (decode_timestamp > last_uop_timestamp)
-        last_uop_timestamp = decode_timestamp;
-
-    /*Submit uops to execution units, and determine the latest completion time*/
-    for (int c = 0; c < (decode_buffer.nr_uops); c++) {
-        if (decode_buffer.earliest_start[c] == -1)
-            start_timestamp = last_uop_timestamp;
-        else
-            start_timestamp = decode_buffer.earliest_start[c];
-
-        last_uop_timestamp = uop_run(decode_buffer.uops[c], start_timestamp);
-        if (last_uop_timestamp > uop_timestamp)
-            uop_timestamp = last_uop_timestamp;
-    }
-
     /*Calculate opseq completion time. Since opseqs complete in order, it
       must be after the last completion.*/
-    if (uop_timestamp <= last_complete_timestamp)
+    if (group_done <= last_complete_timestamp)
         last_complete_timestamp = last_complete_timestamp + 1;
     else
-        last_complete_timestamp = uop_timestamp;
+        last_complete_timestamp = group_done;
 
     /*Advance to next opseq in buffer*/
     opseq_completion_timestamp[next_opseq] = last_complete_timestamp;
@@ -1641,8 +1678,14 @@ decode_flush_p6(void)
         next_opseq = 0;
 
     decode_timestamp++;
-    decode_buffer.nr_uops = 0;
+    group_done = 0;
+    group_ins  = 0;
 }
+
+/*The P6 decoders can decode, per clock :
+  - 1 to 3 'simple' instructions, each up to 1 uOP and 7 bytes long
+  - 1 'complex' instruction, up to 4 uOPs or 3 per cycle for instructions longer than 4 uOPs
+*/
 
 /*The instruction is only of interest here if it's longer than 7 bytes, as that's the
   limit on P6 simple decoding*/
@@ -1688,99 +1731,455 @@ codegen_timing_instr_length(uint64_t deps, uint32_t fetchdat, int op_32)
     return len;
 }
 
-static void
-decode_instruction(const macro_op_t *ins, uint64_t deps, uint32_t fetchdat, int op_32, int bit8)
+/*Opcodes whose operand is a byte (the low opcode bit is not reliable: INC/DEC, XCHG EAX,reg...)*/
+static int
+opcode_is_byte(uint8_t prefix, uint8_t opcode)
 {
-    uint32_t      regmask_required;
-    uint32_t      regmask_modified;
+    if (prefix == 0x0f)
+        return (opcode >= 0x90 && opcode <= 0x9f) || opcode == 0xb0 || opcode == 0xc0;
+    if (prefix)
+        return 0;
+    if (opcode < 0x40)
+        return (opcode & 7) < 6 && !(opcode & 1);
+    switch (opcode) {
+        case 0x80:
+        case 0x82:
+        case 0x84:
+        case 0x86:
+        case 0x88:
+        case 0x8a:
+        case 0xa0:
+        case 0xa2:
+        case 0xa4:
+        case 0xa6:
+        case 0xa8:
+        case 0xaa:
+        case 0xac:
+        case 0xae:
+        case 0xc0:
+        case 0xc6:
+        case 0xd0:
+        case 0xd2:
+        case 0xf6:
+        case 0xfe:
+        case 0x6c:
+        case 0x6e:
+        case 0xe4:
+        case 0xe6:
+        case 0xec:
+        case 0xee:
+            return 1;
+        default:
+            return opcode >= 0xb0 && opcode <= 0xb7;
+    }
+}
+
+enum { FW_NONE, FW_ALL, FW_NOCF };
+enum { FR_NONE, FR_CF, FR_MIXED, FR_OTHER };
+
+static int
+cc_reads(uint8_t cc)
+{
+    switch (cc & 15) {
+        case 2:
+        case 3:
+            return FR_CF;
+        case 6:
+        case 7:
+            return FR_MIXED; /*CF and ZF*/
+        default:
+            return FR_OTHER;
+    }
+}
+
+/*Which flags an instruction writes and reads, by opcode*/
+static void
+flag_effects(uint8_t prefix, uint8_t opcode, uint32_t fetchdat, int *write, int *read)
+{
+    const int reg = (fetchdat >> 3) & 7;
+
+    *write = FW_NONE;
+    *read  = FR_NONE;
+    if (prefix == 0x0f) {
+        if (opcode >= 0x80 && opcode <= 0x8f)
+            *read = cc_reads(opcode);
+        else if ((opcode >= 0x90 && opcode <= 0x9f) || (opcode >= 0x40 && opcode <= 0x4f))
+            *read = cc_reads(opcode);
+        else if (opcode == 0xaf || opcode == 0xa3 || opcode == 0xab || opcode == 0xb3 || opcode == 0xbb || opcode == 0xba
+                 || opcode == 0xbc || opcode == 0xbd || opcode == 0xa4 || opcode == 0xa5 || opcode == 0xac || opcode == 0xad
+                 || opcode == 0xb0 || opcode == 0xb1 || opcode == 0xc0 || opcode == 0xc1)
+            *write = FW_ALL;
+        return;
+    }
+    if (prefix)
+        return;
+    if (opcode < 0x40) {
+        if ((opcode & 7) < 6) {
+            *write = FW_ALL;
+            if ((opcode & 0x18) == 0x10)
+                *read = FR_CF; /*ADC, SBB*/
+        }
+        return;
+    }
+    if (opcode <= 0x4f) {
+        *write = FW_NOCF; /*INC, DEC*/
+        return;
+    }
+    if (opcode >= 0x70 && opcode <= 0x7f) {
+        *read = cc_reads(opcode);
+        return;
+    }
+    switch (opcode) {
+        case 0x69:
+        case 0x6b:
+        case 0x84:
+        case 0x85:
+        case 0xa6:
+        case 0xa7:
+        case 0xa8:
+        case 0xa9:
+        case 0xae:
+        case 0xaf:
+        case 0x9d:
+        case 0x9e:
+            *write = FW_ALL;
+            break;
+        case 0x80:
+        case 0x81:
+        case 0x82:
+        case 0x83:
+            *write = FW_ALL;
+            if (reg == 2 || reg == 3)
+                *read = FR_CF;
+            break;
+        case 0xc0:
+        case 0xc1:
+        case 0xd0:
+        case 0xd1:
+        case 0xd2:
+        case 0xd3:
+            *write = FW_ALL;
+            if (reg == 2 || reg == 3)
+                *read = FR_CF;
+            break;
+        case 0xf6:
+        case 0xf7:
+            if (reg != 2)
+                *write = FW_ALL;
+            break;
+        case 0xfe:
+        case 0xff:
+            if (reg < 2)
+                *write = FW_NOCF;
+            break;
+        case 0x9c:
+        case 0x9f:
+            *read = FR_MIXED; /*PUSHF, LAHF*/
+            break;
+        default:
+            break;
+    }
+}
+
+/*Decodes a 32-bit-addressing memory operand into base, index, scale and displacement.
+  Only the bytes in fetchdat are seen, so a 32-bit displacement is truncated.*/
+static int
+parse_address(uint32_t fetchdat, int op_32, int *base, int *index, int *scale, int *disp)
+{
+    const int modrm = fetchdat & 0xff;
+    const int mod   = modrm >> 6;
+    int       rm    = modrm & 7;
+    int       pos   = 1;
+
+    if (!(op_32 & 0x200) || mod == 3)
+        return 0;
+    *index = -1;
+    *scale = 0;
+    *base  = rm;
+    if (rm == 4) {
+        const int sib = (fetchdat >> 8) & 0xff;
+
+        pos    = 2;
+        *base  = sib & 7;
+        *scale = sib >> 6;
+        if (((sib >> 3) & 7) != 4)
+            *index = (sib >> 3) & 7;
+    }
+    *disp = 0;
+    if (mod == 1) {
+        *disp = (int8_t) ((fetchdat >> (8 * pos)) & 0xff);
+    } else if (mod == 2 || (mod == 0 && *base == 5)) {
+        *disp = (int32_t) ((fetchdat >> (8 * pos)) << (8 * pos)) >> (8 * pos);
+        if (mod == 0)
+            *base = -1;
+    }
+    return 1;
+}
+
+static int
+regs_ready(uint32_t mask)
+{
+    int t = 0;
+
+    for (int c = 0; c < NR_REGS; c++)
+        if ((mask & (1 << c)) && reg_ready[c] > t)
+            t = reg_ready[c];
+    return t;
+}
+
+static int
+partial_stall(uint32_t mask, int read_bits)
+{
+    int t = 0;
+
+    for (int c = 0; c < NR_REGS; c++) {
+        if ((mask & (1 << c)) && reg_partial_bits[c] && read_bits > reg_partial_bits[c] && !(reg_zero_upper & (1 << c))
+            && reg_partial_retire[c] > t)
+            t = reg_partial_retire[c];
+    }
+    return t;
+}
+
+/*Every instruction of the block in decode order, so the block can be replayed*/
+#define MAX_REPLAY 1024
+typedef struct replay_t {
+    const macro_op_t *ins;
+    uint64_t          deps;
+    uint32_t          fetchdat, op_pc;
+    int               op_32, prefixes, saw_66;
+    uint8_t           opcode, last_prefix;
+} replay_t;
+static replay_t replay[MAX_REPLAY];
+static int      nr_replay;
+
+static void
+decode_instruction(const macro_op_t *ins, uint64_t deps, uint32_t fetchdat, int op_32, uint8_t opcode, uint32_t op_pc)
+{
+    const int     bit8         = !(opcode & 1);
+    const int     is_byte      = opcode_is_byte(last_prefix, opcode);
+    const int     opbits       = (op_32 & 0x100) ? 32 : 16;
+    const int     mod3         = (fetchdat & 0xc0) == 0xc0;
+    int           rd_bits      = is_byte ? 8 : opbits;
+    int           wr_bits      = rd_bits;
     int           c;
-    int           d              = 0; /*Complex decoder uOPs*/
-    int           earliest_start = 0;
-    decode_type_t decode_type    = ins->decode_type;
+    int           d            = 0; /*Complex decoder uOPs*/
+    decode_type_t decode_type  = ins->decode_type;
+    int           instr_length = codegen_timing_instr_length(deps, fetchdat, op_32);
+    uint32_t      addr_m       = get_addr_regmask(deps, fetchdat, op_32) & 0xff;
+    uint32_t      src_m        = get_srcdep_mask(deps, fetchdat, bit8, op_32) & 0xff;
+    uint32_t      dst_m        = get_dstdep_mask(deps, fetchdat, bit8) & 0xff;
+    uint32_t      data_m;
+    int           idiom = 0, movx = 0;
+    int           fpu_floor = 0, flags_floor = 0, load_floor = 0;
+    int           fw, fr;
+    int           stall;
+    int           base, index, scale, disp, have_addr;
+    int           ins_done = 0, prev = 0;
+    int           mem_load = 0, mem_store = 0, store_data = 0;
+    int           lin;
 
-    /*Generate input register mask, and determine the earliest time this
-      instruction can start. This is not accurate, as this is calculated per
-      x86 instruction when it should be handled per uop*/
-    regmask_modified = get_dstdep_mask(deps, fetchdat, bit8);
-    regmask_required = regmask_modified | get_addr_regmask(deps, fetchdat, op_32);
-    /*Bits 8 and up are flags, not registers. Visit registers in ascending
-      order, so the highest register with a pending result still wins*/
-    for (uint32_t mask = regmask_required & 0xff; mask; mask &= mask - 1) {
-        c = __builtin_ctz(mask);
-        if (reg_available_timestamp[c] > decode_timestamp)
-            earliest_start = reg_available_timestamp[c];
+    /*MOVZX/MOVSX read a byte or word but write the whole register*/
+    if (last_prefix == 0x0f && (opcode == 0xb6 || opcode == 0xb7 || opcode == 0xbe || opcode == 0xbf)) {
+        movx    = 1;
+        rd_bits = (opcode & 1) ? 16 : 8;
+        wr_bits = 32;
+        dst_m   = 1 << ((fetchdat >> 3) & 7);
+        src_m &= ~dst_m;
+        if (mod3)
+            src_m = (src_m & addr_m) | (1 << ((fetchdat & 7) & ((opcode & 1) ? 7 : 3)));
     }
-    if ((deps & FPU_RW_ST0) && fpu_st_timestamp[0] > decode_timestamp)
-        earliest_start = fpu_st_timestamp[0];
-    if ((deps & FPU_RW_ST1) && fpu_st_timestamp[1] > decode_timestamp)
-        earliest_start = fpu_st_timestamp[1];
-    if (deps & FPU_RW_STREG) {
-        int reg = fetchdat & 7;
+    /*The shared 0F dependency tables carry no register information for these*/
+    if (last_prefix == 0x0f && !movx) {
+        const uint32_t reg_m = 1u << ((fetchdat >> 3) & 7);
+        const uint32_t rm_m  = mod3 ? 1u << (fetchdat & 7) : 0;
 
-        if (fpu_st_timestamp[reg] > decode_timestamp)
-            earliest_start = fpu_st_timestamp[reg];
+        if (opcode == 0xaf || (opcode >= 0x40 && opcode <= 0x4f) || opcode == 0xbc || opcode == 0xbd) {
+            src_m = addr_m | rm_m | (opcode == 0xaf || (opcode >= 0x40 && opcode <= 0x4f) ? reg_m : 0);
+            dst_m = reg_m;
+        } else if (opcode >= 0x90 && opcode <= 0x9f) {
+            src_m = addr_m;
+            dst_m = mod3 ? 1u << ((fetchdat & 7) & 3) : 0;
+        } else if (opcode >= 0xc8 && opcode <= 0xcf) {
+            src_m = dst_m = 1u << (opcode & 7);
+        }
     }
+    if (deps & IMPL_ESP)
+        dst_m &= ~(1u << REG_ESP); /*stack engine: ESP updates are not on the critical path*/
+
+    /*XOR/SUB reg,reg breaks the dependency and leaves no partial-register state*/
+    if (!last_prefix && !movx && (opcode == 0x31 || opcode == 0x33 || opcode == 0x29 || opcode == 0x2b) && mod3
+        && ((fetchdat >> 3) & 7) == (fetchdat & 7) && opbits == 32) {
+        idiom = 1;
+        src_m = 0;
+    }
+    data_m = src_m & ~addr_m;
+    if (!mod3)
+        addr_m &= 0xff;
+
+    flag_effects(last_prefix, opcode, fetchdat, &fw, &fr);
 
     /*Simple decoders are limited to 7 bytes & 1 uOP*/
-    if (decode_type == DECODE_SIMPLE && (codegen_timing_instr_length(deps, fetchdat, op_32) > 7 || ins->nr_uops > 1))
+    if (decode_type == DECODE_SIMPLE && (instr_length > 7 || ins->nr_uops > 1))
         decode_type = DECODE_COMPLEX;
+    /*The 4-1-1 arrangement implies that a complex ins. can't be decoded after another*/
+    if (decode_type == DECODE_COMPLEX && group_ins)
+        decode_flush_p6();
 
-    switch (decode_type) {
-        case DECODE_SIMPLE:
-            if (decode_buffer.nr_uops - d == 2) {
-                decode_buffer.uops[decode_buffer.nr_uops]           = &ins->uop[0];
-                decode_buffer.earliest_start[decode_buffer.nr_uops] = earliest_start;
-                decode_buffer.nr_uops                               = 3;
-                decode_flush_p6();
-            } else if (decode_buffer.nr_uops - d == 1) {
-                decode_buffer.uops[decode_buffer.nr_uops]           = &ins->uop[0];
-                decode_buffer.earliest_start[decode_buffer.nr_uops] = earliest_start;
-                decode_buffer.nr_uops                               = 2 + d;
-                if (d)
-                    decode_flush_p6();
-            } else if (decode_buffer.nr_uops) {
-                decode_buffer.uops[decode_buffer.nr_uops]           = &ins->uop[0];
-                decode_buffer.earliest_start[decode_buffer.nr_uops] = earliest_start;
-                decode_buffer.nr_uops                               = 1 + d;
-            } else {
-                decode_buffer.nr_uops           = 1;
-                decode_buffer.uops[0]           = &ins->uop[0];
-                decode_buffer.earliest_start[0] = earliest_start;
-            }
-            break;
-
-        case DECODE_COMPLEX:
-            if (decode_buffer.nr_uops)
-                decode_flush_p6(); /*The 4-1-1 arrangement implies that a complex ins. can't be decoded after a simple one*/
-
-            d = 0;
-
-            for (c = 0; c < ins->nr_uops; c++) {
-                decode_buffer.uops[d] = &ins->uop[c];
-                if (c == 0)
-                    decode_buffer.earliest_start[d] = earliest_start;
-                else
-                    decode_buffer.earliest_start[d] = -1;
-                d++;
-
-                if ((d == 3) && (ins->nr_uops > 4)) { /*Ins. with >4 uOPs require the use of special units only present on 3 translate PLAs*/
-                    d                     = 0;
-                    decode_buffer.nr_uops = 3;
-                    decode_flush_p6(); /*The other two decoders are halted to preserve in-order issue*/
-                }
-            }
-            if (d) {
-                decode_buffer.nr_uops = d;
-            }
-            break;
+    /*Front-end stalls: partial registers, partial flags, length-changing prefix*/
+    stall = partial_stall(data_m, rd_bits);
+    if (partial_stall(addr_m, (op_32 & 0x200) ? 32 : 16) > stall)
+        stall = partial_stall(addr_m, (op_32 & 0x200) ? 32 : 16);
+    if (fr == FR_MIXED && flags_partial_retire > stall)
+        stall = flags_partial_retire;
+    if (stall > decode_timestamp) {
+        if (group_ins)
+            decode_flush_p6();
+        if (stall > decode_timestamp)
+            decode_timestamp = stall;
+    }
+    if (saw_66 && (deps & HAS_IMM1632)) {
+        if (group_ins)
+            decode_flush_p6();
+        decode_timestamp += LCP_STALL;
     }
 
-    /*Update write timestamps for any output registers*/
-    for (uint32_t mask = regmask_modified & 0xff; mask; mask &= mask - 1)
-        reg_available_timestamp[__builtin_ctz(mask)] = last_complete_timestamp;
+    /*Decode works on 16-byte fetch blocks: a group never spans two, and an
+      instruction that straddles a boundary needs an extra cycle*/
+    lin = (int) (cs + op_pc) - 1 - prefixes;
+    if ((lin >> 4) != fetch_block) {
+        if (group_ins)
+            decode_flush_p6();
+        fetch_block = lin >> 4;
+    }
+    if (((lin & 15) + instr_length) > 16) {
+        if (group_ins)
+            decode_flush_p6();
+        decode_timestamp++;
+        fetch_block = (lin + instr_length - 1) >> 4;
+    }
 
-    if (!(deps & (FPU_POP | FPU_POP2 | FPU_PUSH | FPU_WRITE_ST0 | FPU_WRITE_ST1 | FPU_WRITE_STREG)))
-        return;
+    /*Register, flag and FPU stack readiness*/
+    if (fr != FR_NONE)
+        flags_floor = flags_ready;
+    if ((deps & FPU_READ_ST0) && fpu_st_timestamp[0] > fpu_floor)
+        fpu_floor = fpu_st_timestamp[0];
+    if ((deps & FPU_READ_ST1) && fpu_st_timestamp[1] > fpu_floor)
+        fpu_floor = fpu_st_timestamp[1];
+    if (deps & FPU_READ_STREG) {
+        int reg = fetchdat & 7;
+
+        if (fpu_st_timestamp[reg] > fpu_floor)
+            fpu_floor = fpu_st_timestamp[reg];
+    }
+
+    /*Memory operand: store forwarding*/
+    for (c = 0; c < ins->nr_uops; c++) {
+        if (ins->uop[c].type == UOP_LOAD)
+            mem_load = 1;
+        if (ins->uop[c].type == UOP_STORED)
+            mem_store = 1;
+    }
+    have_addr = (mem_load || mem_store) && !mod3 && parse_address(fetchdat, op_32, &base, &index, &scale, &disp);
+    if (have_addr && mem_load) {
+        for (c = 1; c <= NR_STORES; c++) {
+            const store_t *s = &stores[(next_store - c + NR_STORES) % NR_STORES];
+
+            if (!s->valid || s->modrm_key != (uint8_t) ((base < 0 ? 0xff : base) | (scale << 5)) || s->sib != (uint8_t) index)
+                continue;
+            if ((base >= 0 && reg_write_seq[base] != s->seq_base) || (index >= 0 && reg_write_seq[index] != s->seq_index))
+                continue;
+            if (disp >= s->disp + s->size || disp + (rd_bits >> 3) <= s->disp)
+                continue; /*no overlap*/
+            if (disp == s->disp && (rd_bits >> 3) <= s->size)
+                load_floor = s->data_ready;
+            else
+                load_floor = s->retire + STORE_FWD_FAIL;
+            break;
+        }
+    }
+
+    /*Schedule each uop*/
+    for (c = 0; c < ins->nr_uops; c++) {
+        const p6_uop_t *uop   = &ins->uop[c];
+        int             ready = decode_timestamp;
+        int             done;
+
+        switch (uop->type) {
+            case UOP_LOAD:
+            case UOP_FLOAD:
+            case UOP_MLOAD:
+                ready = MAX(ready, regs_ready(addr_m));
+                if (uop->type == UOP_LOAD)
+                    ready = MAX(ready, load_floor);
+                break;
+            case UOP_STOREA:
+            case UOP_FSTOREA:
+            case UOP_MSTOREA:
+                ready = MAX(ready, regs_ready(addr_m));
+                break;
+            default:
+                ready = MAX(ready, regs_ready(data_m));
+                ready = MAX(ready, MAX(fpu_floor, flags_floor));
+                if (c > 0)
+                    ready = MAX(ready, prev);
+                break;
+        }
+        done = uop_run(uop, ready);
+        if (uop->type == UOP_STORED)
+            store_data = done;
+        if (uop->type != UOP_STOREA && uop->type != UOP_FSTOREA && uop->type != UOP_MSTOREA)
+            prev = done;
+        if (done > ins_done)
+            ins_done = done;
+
+        /*Instructions longer than 4 uops use 3 uops a cycle on the decoders*/
+        if (ins->nr_uops > 4 && ++d == 3) {
+            d = 0;
+            group_done = MAX(group_done, ins_done);
+            decode_flush_p6();
+        }
+    }
+    group_done = MAX(group_done, ins_done);
+    group_ins++;
+    if (ins->nr_uops > 4 || group_ins >= 3)
+        decode_flush_p6();
+
+    /*Publish results*/
+    if (mem_store && have_addr) {
+        store_t *s = &stores[next_store];
+
+        s->valid      = 1;
+        s->modrm_key  = (uint8_t) ((base < 0 ? 0xff : base) | (scale << 5));
+        s->sib        = (uint8_t) index;
+        s->disp       = disp;
+        s->size       = rd_bits >> 3;
+        s->data_ready = store_data ? store_data : ins_done;
+        s->retire     = s->data_ready + 3;
+        s->seq_base   = base >= 0 ? reg_write_seq[base] : 0;
+        s->seq_index  = index >= 0 ? reg_write_seq[index] : 0;
+        next_store    = (next_store + 1) % NR_STORES;
+    }
+    for (c = 0; c < NR_REGS; c++) {
+        if (!(dst_m & (1 << c)))
+            continue;
+        reg_write_seq[c]++;
+        reg_ready[c] = prev ? prev : ins_done;
+        if (idiom) {
+            reg_zero_upper |= 1 << c;
+            reg_partial_bits[c] = 0;
+        } else if (wr_bits == 32) {
+            reg_zero_upper &= ~(1 << c);
+            reg_partial_bits[c] = 0;
+        } else if (!(reg_zero_upper & (1 << c))) {
+            reg_partial_bits[c]   = wr_bits;
+            reg_partial_retire[c] = reg_ready[c] + PARTIAL_RETIRE;
+        }
+    }
+    if (fw != FW_NONE) {
+        flags_ready          = prev ? prev : ins_done;
+        flags_partial_retire = (fw == FW_NOCF) ? flags_ready + PARTIAL_RETIRE : 0;
+    }
+
     if (deps & FPU_POP) {
         for (c = 0; c < 7; c++)
             fpu_st_timestamp[c] = fpu_st_timestamp[c + 1];
@@ -1797,16 +2196,134 @@ decode_instruction(const macro_op_t *ins, uint64_t deps, uint32_t fetchdat, int 
         fpu_st_timestamp[0] = 0;
     }
     if (deps & FPU_WRITE_ST0)
-        fpu_st_timestamp[0] = last_complete_timestamp;
+        fpu_st_timestamp[0] = ins_done;
     if (deps & FPU_WRITE_ST1)
-        fpu_st_timestamp[1] = last_complete_timestamp;
+        fpu_st_timestamp[1] = ins_done;
     if (deps & FPU_WRITE_STREG) {
         int reg = fetchdat & 7;
         if (deps & FPU_POP)
             reg--;
         if (reg >= 0 && !(reg == 0 && (deps & FPU_WRITE_ST0)) && !(reg == 1 && (deps & FPU_WRITE_ST1)))
-            fpu_st_timestamp[reg] = last_complete_timestamp;
+            fpu_st_timestamp[reg] = ins_done;
     }
+}
+
+/*
+ * Blocks overlap on an out-of-order core: the next one starts while the tail of
+ * this one is still executing. Where control can leave the block, the cost of
+ * everything decoded so far is taken as what it costs when run again straight
+ * away from the state it left behind: its throughput in a loop, or its
+ * loop-carried dependency chain, not its latency in isolation.
+ */
+typedef struct p6_state_t {
+    int      decode_timestamp, last_complete_timestamp, group_done, group_ins, fetch_block, next_opseq, next_store;
+    int      opseq_completion_timestamp[NR_OPSEQS];
+    int      reg_ready[NR_REGS], reg_partial_bits[NR_REGS], reg_partial_retire[NR_REGS], reg_write_seq[NR_REGS];
+    uint8_t  reg_zero_upper;
+    int      flags_ready, flags_partial_retire;
+    int      fpu_st_timestamp[8];
+    int      unit_available[8];
+    store_t  stores[NR_STORES];
+} p6_state_t;
+
+static void
+state_save(p6_state_t *t)
+{
+    t->decode_timestamp        = decode_timestamp;
+    t->last_complete_timestamp = last_complete_timestamp;
+    t->group_done              = group_done;
+    t->group_ins               = group_ins;
+    t->fetch_block             = fetch_block;
+    t->next_opseq              = next_opseq;
+    t->next_store              = next_store;
+    memcpy(t->opseq_completion_timestamp, opseq_completion_timestamp, sizeof(opseq_completion_timestamp));
+    memcpy(t->reg_ready, reg_ready, sizeof(reg_ready));
+    memcpy(t->reg_partial_bits, reg_partial_bits, sizeof(reg_partial_bits));
+    memcpy(t->reg_partial_retire, reg_partial_retire, sizeof(reg_partial_retire));
+    memcpy(t->reg_write_seq, reg_write_seq, sizeof(reg_write_seq));
+    t->reg_zero_upper        = reg_zero_upper;
+    t->flags_ready           = flags_ready;
+    t->flags_partial_retire  = flags_partial_retire;
+    memcpy(t->fpu_st_timestamp, fpu_st_timestamp, sizeof(fpu_st_timestamp));
+    for (int c = 0; c < nr_units; c++)
+        t->unit_available[c] = units[c].first_available_cycle;
+    memcpy(t->stores, stores, sizeof(stores));
+}
+
+static void
+state_restore(const p6_state_t *t)
+{
+    decode_timestamp        = t->decode_timestamp;
+    last_complete_timestamp = t->last_complete_timestamp;
+    group_done              = t->group_done;
+    group_ins               = t->group_ins;
+    fetch_block             = t->fetch_block;
+    next_opseq              = t->next_opseq;
+    next_store              = t->next_store;
+    memcpy(opseq_completion_timestamp, t->opseq_completion_timestamp, sizeof(opseq_completion_timestamp));
+    memcpy(reg_ready, t->reg_ready, sizeof(reg_ready));
+    memcpy(reg_partial_bits, t->reg_partial_bits, sizeof(reg_partial_bits));
+    memcpy(reg_partial_retire, t->reg_partial_retire, sizeof(reg_partial_retire));
+    memcpy(reg_write_seq, t->reg_write_seq, sizeof(reg_write_seq));
+    reg_zero_upper       = t->reg_zero_upper;
+    flags_ready          = t->flags_ready;
+    flags_partial_retire = t->flags_partial_retire;
+    memcpy(fpu_st_timestamp, t->fpu_st_timestamp, sizeof(fpu_st_timestamp));
+    for (int c = 0; c < nr_units; c++)
+        units[c].first_available_cycle = t->unit_available[c];
+    memcpy(stores, t->stores, sizeof(stores));
+}
+
+static int charged;        /*cycles already handed to the code generator for this block*/
+static int finalized_upto; /*instructions covered by the last steady-state estimate*/
+
+/*Charges the steady-state cost of the block so far; leaves the timing state as it was*/
+static void
+charge_steady_state(void)
+{
+    p6_state_t saved;
+    int        first, steady;
+
+    if (!nr_replay || nr_replay >= MAX_REPLAY || finalized_upto == nr_replay)
+        return;
+    finalized_upto = nr_replay;
+    state_save(&saved);
+    if (group_ins)
+        decode_flush_p6();
+    first = last_complete_timestamp;
+    {
+        const uint8_t saved_prefix = last_prefix;
+        const int     saved_pref   = prefixes;
+        const int     saved_66     = saw_66;
+
+        for (int c = 0; c < nr_replay; c++) {
+            last_prefix = replay[c].last_prefix;
+            prefixes    = replay[c].prefixes;
+            saw_66      = replay[c].saw_66;
+            decode_instruction(replay[c].ins, replay[c].deps, replay[c].fetchdat, replay[c].op_32, replay[c].opcode, replay[c].op_pc);
+        }
+        if (group_ins)
+            decode_flush_p6();
+        last_prefix = saved_prefix;
+        prefixes    = saved_pref;
+        saw_66      = saved_66;
+    }
+    steady = last_complete_timestamp - first;
+    state_restore(&saved);
+    codegen_block_cycles += steady - charged;
+    charged = steady;
+}
+
+/*Opcodes after which the code generator may leave the block*/
+static int
+leaves_block(uint8_t prefix, uint8_t opcode, uint32_t fetchdat)
+{
+    if (prefix == 0x0f)
+        return opcode >= 0x80 && opcode <= 0x8f;
+    if (prefix == 0xf2 || prefix == 0xf3)
+        return 0;
+    return (opcode & 0xf0) == 0x70 || (opcode & 0xfc) == 0xe0 || opcode == 0xc2 || (opcode & 0xfe) == 0xca
+        || (opcode & 0xfc) == 0xcc || (opcode & 0xfc) == 0xe8 || (opcode == 0xff && (fetchdat & 0x38) >= 0x10 && (fetchdat & 0x38) < 0x30);
 }
 
 void
@@ -1819,21 +2336,30 @@ codegen_timing_p6_block_start(void)
 
     decode_timestamp        = 0;
     last_complete_timestamp = 0;
+    group_done              = 0;
+    group_ins               = 0;
+    fetch_block             = -1;
+    nr_replay               = 0;
+    charged                 = 0;
+    finalized_upto          = 0;
 
     for (c = 0; c < NR_OPSEQS; c++)
         opseq_completion_timestamp[c] = 0;
     next_opseq = 0;
 
-    for (c = 0; c < NR_REGS; c++)
-        reg_available_timestamp[c] = 0;
+    for (c = 0; c < NR_REGS; c++) {
+        reg_ready[c]          = 0;
+        reg_partial_bits[c]   = 0;
+        reg_partial_retire[c] = 0;
+        reg_write_seq[c]      = 0;
+    }
+    reg_zero_upper       = 0;
+    flags_ready          = 0;
+    flags_partial_retire = 0;
     for (c = 0; c < 8; c++)
         fpu_st_timestamp[c] = 0;
-
-    /* A block that ended on the abort path was never flushed: drop its
-       pending uops and dependency-chain timestamp so they cannot carry
-       into this block and inflate its unit timestamps without bound. */
-    decode_buffer.nr_uops = 0;
-    last_uop_timestamp    = 0;
+    memset(stores, 0, sizeof(stores));
+    next_store = 0;
 }
 
 void
@@ -1848,6 +2374,7 @@ codegen_timing_p6_start(void)
     }
     last_prefix = 0;
     prefixes    = 0;
+    saw_66      = 0;
 }
 
 void
@@ -1855,6 +2382,8 @@ codegen_timing_p6_prefix(uint8_t prefix, UNUSED(uint32_t fetchdat))
 {
     if (prefix != 0x0f)
         decode_timestamp++;
+    if (prefix == 0x66)
+        saw_66 = 1;
 
     last_prefix = prefix;
     prefixes++;
@@ -1864,11 +2393,15 @@ void
 codegen_timing_p6_opcode(uint8_t opcode, UNUSED(uint32_t fetchdat), int op_32, UNUSED(uint32_t op_pc))
 {
     const macro_op_t **ins_table;
+    const macro_op_t  *ins_table_one;
     const uint64_t    *deps;
+    uint64_t           deps_one;
     int                mod3                        = ((fetchdat & 0xc0) == 0xc0);
     int                old_last_complete_timestamp = last_complete_timestamp;
-    int                bit8                        = !(opcode & 1);
 
+    const uint8_t raw_opcode = opcode;
+    int bit8_unused = 0;
+    (void) bit8_unused;
     switch (last_prefix) {
         case 0x0f:
             ins_table = mod3 ? opcode_timings_p6_0f_mod3 : opcode_timings_p6_0f;
@@ -1973,29 +2506,33 @@ codegen_timing_p6_opcode(uint8_t opcode, UNUSED(uint32_t fetchdat), int op_32, U
     /*The MMX rows (0F 60-7F, D0-FF) on a P6 without MMX, the Pentium Pro: the
       instructions are #UD there, and its units have no MMX uop types to run
       them on*/
-    if ((last_prefix == 0x0f) && !cpu_has_feature(CPU_FEATURE_MMX) && (((opcode & 0xe0) == 0x60) || (opcode >= 0xd0)))
-        decode_instruction(&complex_alu1_op, 0, fetchdat, op_32, bit8);
-    else if (ins_table[opcode])
-        decode_instruction(ins_table[opcode], deps[opcode], fetchdat, op_32, bit8);
-    else
-        decode_instruction(&complex_alu1_op, 0, fetchdat, op_32, bit8);
+    if (!ins_table[opcode] || ((last_prefix == 0x0f) && !cpu_has_feature(CPU_FEATURE_MMX) && (((opcode & 0xe0) == 0x60) || (opcode >= 0xd0)))) {
+        ins_table_one = &complex_alu1_op;
+        deps_one      = 0;
+    } else {
+        ins_table_one = ins_table[opcode];
+        deps_one      = deps[opcode];
+    }
+    if (nr_replay < MAX_REPLAY)
+        replay[nr_replay++] = (replay_t) { ins_table_one, deps_one, fetchdat, op_pc, op_32, prefixes, saw_66, raw_opcode, last_prefix };
+    decode_instruction(ins_table_one, deps_one, fetchdat, op_32, raw_opcode, op_pc);
     codegen_block_cycles += (last_complete_timestamp - old_last_complete_timestamp);
+    charged += (last_complete_timestamp - old_last_complete_timestamp);
+    if (leaves_block(last_prefix, raw_opcode, fetchdat))
+        charge_steady_state();
+    last_prefix = 0;
 }
 
 void
 codegen_timing_p6_block_end(void)
 {
-    if (decode_buffer.nr_uops) {
-        int old_last_complete_timestamp = last_complete_timestamp;
-        decode_flush_p6();
-        codegen_block_cycles += (last_complete_timestamp - old_last_complete_timestamp);
-    }
+    charge_steady_state();
 }
 
 int
 codegen_timing_p6_jump_cycles(void)
 {
-    if (decode_buffer.nr_uops)
+    if (group_ins)
         return 1;
     return 0;
 }

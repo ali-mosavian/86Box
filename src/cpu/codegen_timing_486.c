@@ -336,6 +336,20 @@ codegen_timing_486_prefix(uint8_t prefix, UNUSED(uint32_t fetchdat))
     last_prefix = prefix;
 }
 
+static int
+has_base_index(uint32_t fetchdat, int op_32)
+{
+    const int rm = fetchdat & 7;
+    const int md = (fetchdat >> 6) & 3;
+
+    if (!(op_32 & 0x200))
+        return rm < 4;
+    if (rm != 4)
+        return 0;
+    const int sib = (fetchdat >> 8) & 0xff;
+    return ((sib >> 3) & 7) != 4 && !((sib & 7) == 5 && md == 0);
+}
+
 void
 codegen_timing_486_opcode(uint8_t opcode, uint32_t fetchdat, int op_32, UNUSED(uint32_t op_pc))
 {
@@ -441,6 +455,8 @@ codegen_timing_486_opcode(uint8_t opcode, uint32_t fetchdat, int op_32, UNUSED(u
     }
 
     timing_count += COUNT(timings[opcode], op_32);
+    if (!mod3 && has_base_index(fetchdat, op_32))
+        timing_count++; /*base+index addressing: one extra cycle (i486 programmer's reference)*/
     if (regmask_modified & get_addr_regmask(deps[opcode], fetchdat, op_32))
         timing_count++; /*AGI stall*/
     codegen_block_cycles += timing_count;

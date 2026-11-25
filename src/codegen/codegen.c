@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include <string.h>
 #include <86box/86box.h>
 #include "cpu.h"
 #include <86box/mem.h>
@@ -114,9 +115,51 @@ int (*codegen_timing_jump_cycles)(void);
 void (*codegen_timing_save)(codegen_timing_state_t *state);
 void (*codegen_timing_load)(const codegen_timing_state_t *state);
 
+/*
+ * Branch prediction: a direct-mapped BTB of two-bit counters keyed by the branch
+ * address. A branch missing from the BTB is predicted by the static rule
+ * (backward taken, forward not taken). A wrong prediction costs
+ * codegen_bp_penalty cycles; zero turns the model off.
+ * Penalties: P6 about 12 (Intel P6 optimization manual: 10-15), P5 4
+ * (Pentium: 3-4, Agner Fog microarchitecture).
+ */
+#define BTB_ENTRIES 512
+int codegen_bp_penalty;
+static struct {
+    uint32_t pc;
+    uint8_t  valid;
+    uint8_t  counter;
+} btb[BTB_ENTRIES];
+
+void
+codegen_bp_resolve(uint32_t pc, uint32_t flags)
+{
+    const int taken    = flags & 1;
+    const int backward = (flags >> 1) & 1;
+    const int slot     = (pc ^ (pc >> 9)) & (BTB_ENTRIES - 1);
+    int       predicted;
+
+    if (btb[slot].valid && btb[slot].pc == pc) {
+        predicted = btb[slot].counter >= 2;
+        if (taken && btb[slot].counter < 3)
+            btb[slot].counter++;
+        else if (!taken && btb[slot].counter > 0)
+            btb[slot].counter--;
+    } else {
+        predicted = backward;
+        btb[slot].valid   = 1;
+        btb[slot].pc      = pc;
+        btb[slot].counter = taken ? 2 : 1;
+    }
+    if (predicted != taken)
+        cycles -= codegen_bp_penalty;
+}
+
 void
 codegen_timing_set(codegen_timing_t *timing)
 {
+    codegen_bp_penalty = (timing == &codegen_timing_p6) ? 12 : (timing == &codegen_timing_pentium) ? 4 : 0;
+    memset(btb, 0, sizeof(btb));
     codegen_timing_start       = timing->start;
     codegen_timing_prefix      = timing->prefix;
     codegen_timing_opcode      = timing->opcode;

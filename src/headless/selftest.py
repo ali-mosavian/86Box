@@ -133,6 +133,59 @@ class Headless(unittest.TestCase):
             tsc = out[f"tsc {op}"][-1] / 320000
             self.assertAlmostEqual(pit, tsc, delta=0.05 * tsc)
 
+    def bench(self, vm: str, com: str) -> tuple[float, float]:
+        """Cycles per iteration of (A, B) from pmbench.asm; PIT ticks are scaled by the VM clock."""
+        mhz = {"qb-486": 66_666_666, "qb-p100": 100_000_000, "qb-ppro200": 200_000_000}[
+            vm
+        ]
+        m = re.search(r"(\w+) A=(\d+) B=(\d+) N=(\d+)\s*$", run(vm, com).debug)
+        assert m
+        unit, a, b, n = m.groups()
+        f = mhz / 1_193_182 if unit == "pit" else 1
+        return int(a) * f / int(n), int(b) * f / int(n)
+
+    def test_p6_imul_chain_is_four_cycles_independent_is_one(self) -> None:
+        """Every multiply had latency 1: a dependent chain read 1.0 per imul, not 4."""
+        a, b = self.bench("qb-ppro200", "pmimul.com")
+        self.assertAlmostEqual(a / 8, 4.0, delta=0.5)
+        self.assertLess(b / 8, 1.5)
+
+    def test_p6_partial_register_read_stalls(self) -> None:
+        """mov al,[m] then add ebx,eax cost the same as the movzx form; it stalls 5+ cycles."""
+        a, b = self.bench("qb-ppro200", "pmpartl.com")
+        self.assertGreater((a - b) / 4, 5)
+
+    def test_p6_store_forwarding_failure_stalls(self) -> None:
+        """A dword store then a word load at +2 forwarded for free; it costs several cycles."""
+        a, b = self.bench("qb-ppro200", "pmstfwd.com")
+        self.assertGreater((a - b) / 4, 3)
+
+    def test_p6_alternating_branch_mispredicts(self) -> None:
+        """No branch predictor: alternating jz cost the same as a never-taken one."""
+        a, b = self.bench("qb-ppro200", "pmbranch.com")
+        self.assertGreater(a - b, 10)
+
+    def test_p5_mispredict_costs_cycles(self) -> None:
+        a, b = self.bench("qb-p100", "pmbranch.com")
+        self.assertGreater(a - b, 4)
+
+    def test_agi_costs_one_cycle_on_486_and_p5(self) -> None:
+        """An address register written by the previous instruction costs one extra cycle."""
+        for vm in ("qb-486", "qb-p100"):
+            a, b = self.bench(vm, "pmagi.com")
+            with self.subTest(vm=vm):
+                self.assertGreaterEqual((a - b) / 4, 0.4)
+
+    def test_486_base_plus_index_costs_one_extra_cycle(self) -> None:
+        """[esi+edi] loaded as fast as [esi]; the 486 charges one more cycle."""
+        a, b = self.bench("qb-486", "pmbase.com")
+        self.assertAlmostEqual((a - b) / 8, 1.0, delta=0.2)
+
+    def test_486_taken_branch_costs_more_than_not_taken(self) -> None:
+        """A taken jcc cost the same as a not-taken one; the 486 takes 3 cycles, not 1."""
+        a, b = self.bench("qb-486", "pmbranch.com")
+        self.assertGreater(a - b, 1.5)
+
     def test_boot_skips_cmos_prompt(self) -> None:
         for vm in ("qb-486", "qb-p100", "qb-ppro200"):
             with self.subTest(vm=vm), tempfile.TemporaryDirectory() as tmp:

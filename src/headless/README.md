@@ -109,6 +109,13 @@ valid settings.
 - The PIT counter is 16 bits and wraps every 54.9 ms; time shorter loops.
 - On the 486 and Pentium models a 0x66 operand-size prefix (32-bit code in
   real mode) costs extra cycles; protected-mode 32-bit code does not pay it.
+- The dynarec timing models are calibrated by `examples/pmbench.asm`
+  (flat protected-mode micro-benchmarks, `-DTEST=1..6`, run by `selftest.py`):
+  P6 multiplier latency 4, partial-register and partial-flags stalls,
+  store-forwarding failure, 66h length-changing prefix, 16-byte fetch
+  blocks; a 512-entry BTB of two-bit counters charges mispredicts (P6 12
+  cycles, Pentium 4); the 486 charges base+index addressing and 2 extra
+  cycles per taken jcc. The interpreter (`cpu_use_dynarec=0`) is unchanged.
 
 ## Checks
 
