@@ -2,9 +2,9 @@
  * PC sampling and guest memory reads.
  *
  * Samples come from a timer in 86Box's own timer system, so no CPU, timer or
- * dynarec timing code changes. The timer fires between dynarec blocks, so a
- * sample is the PC at the next block boundary; with the interpreter it is the
- * exact instruction.
+ * dynarec timing code changes. The timer fires after a dynarec block has run,
+ * so a sample is the start of that block (cpu_exec_start_pc); with the
+ * interpreter it is the exact instruction.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,7 +37,8 @@ static slot_t    *table;
 static void
 sample(UNUSED(void *priv))
 {
-    const uint32_t pc = cpu_state.seg_cs.base + cpu_state.pc;
+    /* Timers run after a block finishes: charge the block that was running, not its successor. */
+    const uint32_t pc = cpu_use_dynarec ? cpu_exec_start_pc : cpu_state.seg_cs.base + cpu_state.pc;
     uint32_t       h  = (pc * 2654435761u) >> 16;
 
     total++;
