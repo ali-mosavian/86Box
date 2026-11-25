@@ -99,6 +99,31 @@ class Headless(unittest.TestCase):
             )
             self.assertGreater(inside, 0.9 * data["samples"])
 
+    def test_profile_charges_the_block_that_ran(self) -> None:
+        """Samples were recorded at the block after the running one: a 16-imul block read as idle."""
+        with self.hanging("blocks.com") as c, tempfile.TemporaryDirectory() as tmp:
+            out = ""
+            for _ in range(600):
+                out += c.debug_out()
+                if m := re.search(
+                    r"SHORT ([0-9A-F]{8}) LONG ([0-9A-F]{8}) END ([0-9A-F]{8})\n", out
+                ):
+                    break
+                c.sleep(100)
+            else:
+                self.fail("blocks.com never reported its addresses")
+            short, long_, end = (int(g, 16) for g in m.groups())
+            c.profile_start(20)
+            c.sleep(200)
+            path = Path(tmp) / "p.json"
+            c.profile_stop(path)
+            data = json.loads(path.read_text())
+            in_long = sum(
+                n for pc, n in data["pcs"].items() if long_ <= int(pc, 16) < end
+            )
+            self.assertGreater(in_long, 0.9 * data["samples"])
+            self.assertGreater(long_, short)
+
     def test_mem_read_returns_guest_bytes(self) -> None:
         with self.hanging("spin.com") as c, tempfile.TemporaryDirectory() as tmp:
             _, data = self.spin_addresses(c)
@@ -150,22 +175,32 @@ class Headless(unittest.TestCase):
         self.assertAlmostEqual(a / 8, 4.0, delta=0.5)
         self.assertLess(b / 8, 1.5)
 
-    def test_p6_partial_register_read_stalls(self) -> None:
-        """mov al,[m] then add ebx,eax cost the same as the movzx form; it stalls 5+ cycles."""
+    def test_p6_partial_register_read_stalls_five_to_six_cycles(self) -> None:
+        """Agner Fog: a partial register stall is 5-6 clocks. Modelled as 6.0-7.0 before the fix."""
         a, b = self.bench("qb-ppro200", "pmpartl.com")
-        self.assertGreater((a - b) / 4, 5)
+        self.assertGreater((a - b) / 4, 5.0)
+        self.assertLess((a - b) / 4, 6.5)
 
-    def test_p6_store_forwarding_failure_stalls(self) -> None:
-        """A dword store then a word load at +2 forwarded for free; it costs several cycles."""
+    def test_p6_store_forwarding_failure_costs_seven_to_eight_cycles(self) -> None:
+        """Agner Fog: a failed store forward costs about 7-8 clocks; it read 4 (chained) or 14."""
         a, b = self.bench("qb-ppro200", "pmstfwd.com")
-        self.assertGreater((a - b) / 4, 3)
+        self.assertGreater((a - b) / 4, 6.5)
+        self.assertLess((a - b) / 4, 8.5)
 
-    def test_p6_alternating_branch_mispredicts(self) -> None:
-        """No branch predictor: alternating jz cost the same as a never-taken one."""
+    def test_p6_alternating_branch_is_predicted(self) -> None:
+        """The P6 two-level predictor learns period 2; two-bit counters mispredicted half the time.
+        Read 2.5 with no misprediction when a jcc exit charged its open decode group twice."""
         a, b = self.bench("qb-ppro200", "pmbranch.com")
-        self.assertGreater(a - b, 10)
+        self.assertLess(a - b, 2)
 
-    def test_p5_mispredict_costs_cycles(self) -> None:
+    def test_p6_random_branch_mispredicts_half_the_time(self) -> None:
+        """An xorshift bit is unpredictable: about half of a 15-cycle mispredict per iteration."""
+        a, b = self.bench("qb-ppro200", "pmrand.com")
+        self.assertGreater(a - b, 5)
+        self.assertLess(a - b, 10)
+
+    def test_p5_alternating_branch_still_costs_cycles(self) -> None:
+        """The P5 has one two-bit counter per branch and no history."""
         a, b = self.bench("qb-p100", "pmbranch.com")
         self.assertGreater(a - b, 4)
 

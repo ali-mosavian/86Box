@@ -1540,8 +1540,13 @@ static int     saw_66;
  *   - Decode works on 16-byte fetch blocks.
  */
 #define LOAD_LATENCY          3
-#define PARTIAL_RETIRE 6
-#define STORE_FWD_FAIL 10
+/*
+ * Agner Fog, "The microarchitecture of Intel, AMD and VIA CPUs", PPro/P2/P3
+ * sections 6.8 and 6.9: a partial register stall "gives a delay of 5 - 6
+ * clocks"; a failed store forwarding costs "approximately 7 - 8 clock cycles".
+ */
+#define PARTIAL_RETIRE 5
+#define STORE_FWD_FAIL 7
 #define LCP_STALL             6
 #define UNPIPELINED_THRESHOLD 6 /*uops this slow occupy their unit for the whole latency*/
 
@@ -2093,7 +2098,7 @@ decode_instruction(const macro_op_t *ins, uint64_t deps, uint32_t fetchdat, int 
             if (disp == s->disp && (rd_bits >> 3) <= s->size)
                 load_floor = s->data_ready;
             else
-                load_floor = s->retire + STORE_FWD_FAIL;
+                load_floor = s->data_ready + STORE_FWD_FAIL;
             break;
         }
     }
@@ -2529,11 +2534,11 @@ codegen_timing_p6_block_end(void)
     charge_steady_state();
 }
 
+/*charge_steady_state() already charged the open decode group at the exit.
+  Not NULL: that would charge timing_bt instead*/
 int
 codegen_timing_p6_jump_cycles(void)
 {
-    if (group_ins)
-        return 1;
     return 0;
 }
 
