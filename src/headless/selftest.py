@@ -243,6 +243,10 @@ class Headless(unittest.TestCase):
         """arm64 FTST compared against scratch - scratch: NaN after a load of +Inf, so 1.0 read unordered."""
         self.assertEqual(run("qb-486", "ftstinf.com").code, 0)
 
+    def test_unrolled_jl_and_jge_loops_fall_through(self) -> None:
+        """An unrolled JL/JGE loop left through its head: it ran 1001 times, not 100."""
+        self.assertEqual(run("qb-486", "jlloop.com").code, 0)
+
     def test_boot_skips_cmos_prompt(self) -> None:
         for vm in ("qb-486", "qb-p100", "qb-ppro200"):
             with self.subTest(vm=vm), tempfile.TemporaryDirectory() as tmp:
