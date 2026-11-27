@@ -647,7 +647,8 @@ codegen_FTST(codeblock_t *block, uop_t *uop)
     int src_size_a = IREG_GET_SIZE(uop->src_reg_a_real);
 
     if (REG_IS_W(dest_size) && REG_IS_D(src_size_a)) {
-        host_arm64_FSUB_D(block, REG_V_TEMP, REG_V_TEMP, REG_V_TEMP);
+        /* +0: x - x is NaN when the scratch register holds an infinity or a NaN */
+        host_arm64_EOR_REG_V(block, REG_V_TEMP, REG_V_TEMP, REG_V_TEMP);
         host_arm64_MOVZ_IMM(block, dest_reg, 0);
         host_arm64_FCMP_D(block, src_reg_a, REG_V_TEMP);
         host_arm64_ORR_IMM(block, REG_TEMP, dest_reg, FPU_SW_C3);

@@ -239,6 +239,10 @@ class Headless(unittest.TestCase):
         a, b = self.bench("qb-486", "pmaddi.com")
         self.assertAlmostEqual((a - b) / 16, 0.0, delta=0.3)
 
+    def test_ftst_after_an_infinity_load(self) -> None:
+        """arm64 FTST compared against scratch - scratch: NaN after a load of +Inf, so 1.0 read unordered."""
+        self.assertEqual(run("qb-486", "ftstinf.com").code, 0)
+
     def test_boot_skips_cmos_prompt(self) -> None:
         for vm in ("qb-486", "qb-p100", "qb-ppro200"):
             with self.subTest(vm=vm), tempfile.TemporaryDirectory() as tmp:
