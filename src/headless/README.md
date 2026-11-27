@@ -41,13 +41,13 @@ One JSON object per line, one reply per request, `{"ok": true, ...}` or
 
 | `cmd` | arguments | reply |
 |---|---|---|
-| `status` | | `state` (running/paused), `machine`, `cpu`, `cpu_hz`, `emu_ms`, `tsc`, `unthrottled`, `video_mode`, `text_mode`, `cr0`, `cache_int`, `cache_ext` |
+| `status` | | `state` (running/paused, also while the core pauses, e.g. a guest in ACPI sleep), `machine`, `cpu`, `cpu_hz`, `emu_ms`, `tsc`, `unthrottled`, `video_mode`, `text_mode`, `cr0`, `cache_int`, `cache_ext` |
 | `screen_text` | | `text_mode`, `video_mode`; in text mode also `cols`, `rows`, `cursor_x`, `cursor_y`, `text` (UTF-8 from CP437, one line per row) |
 | `screenshot` | `path` (`.ppm` for PPM, else PNG) | `path`, `width`, `height` |
 | `keys` | `text` (typed, `\n` is Enter), `keys` (names or chains: `Enter`, `Esc`, `F1`, `Del`, `Up`, `Ctrl+Alt+Del`), `delay_ms` (emulated, default 10) | after the last key is delivered |
 | `wait_text` | `pattern` (POSIX extended regex, line-wise), `timeout` (host seconds, default 30) | `matched`, `text`; error `timeout` otherwise |
 | `sleep` | `ms` (emulated) | after that much emulated time |
-| `pause`, `resume` | | |
+| `pause`, `resume` | | `resume` also ends the core's pauses, waking a guest from ACPI sleep |
 | `reset` | | hard reset |
 | `debug_out` | | `data`, `bytes`: what the guest wrote to port 0xE9 since the last call; also echoed to stderr |
 | `profile_start` | `interval_us` (emulated, default 20) | start sampling the guest PC |

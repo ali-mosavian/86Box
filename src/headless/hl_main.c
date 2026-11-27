@@ -1,9 +1,10 @@
 /*
  * 86Box headless frontend: no window, no audio, driven over a unix socket.
  *
- * The emulator and the control socket share this one thread. The CPU runs in
- * 1 ms slices of emulated time (pc_run); guest clocks derive from emulated
- * cycles only, so the host pace never reaches the guest.
+ * The emulator and the control socket share this one thread, run by the core's
+ * run control loop (runctl.h). The CPU runs in 1 ms slices of emulated time
+ * (pc_run); guest clocks derive from emulated cycles only, so the host pace
+ * never reaches the guest.
  */
 #include <getopt.h>
 #include <signal.h>
@@ -21,12 +22,11 @@
 #include <86box/keyboard.h>
 #include <86box/nvr.h>
 #include <86box/plat.h>
+#include <86box/runctl.h>
 #include <86box/video.h>
 
 #include "cpu.h"
 #include "hl.h"
-
-#define MAX_BEHIND_NS 50000000ull /* give up catching up after 50 ms */
 
 extern int exit_event;
 
@@ -35,9 +35,8 @@ int          usb_activity;
 
 static volatile sig_atomic_t quit_flag;
 static volatile int          exit_code;
-static int                   paused;
-static int                   unthrottled;
 static uint64_t              emu_ns;
+static unsigned              frame;
 
 uint64_t
 hl_now_ns(void)
@@ -69,6 +68,7 @@ hl_request_quit(int code)
         quit_flag = 1;
     }
     cycles -= 99999999;
+    runctl_request_stop();
 }
 
 int
@@ -86,25 +86,52 @@ hl_exit_code(void)
 int
 hl_paused(void)
 {
-    return paused;
+    return runctl_paused();
 }
 
+/* Resume clears every reason the user's Resume may: a guest's ACPI sleep wakes. */
 void
 hl_set_paused(int p)
 {
-    paused = p;
+    if (p)
+        runctl_pause(RUN_PAUSE_USER);
+    else
+        runctl_resume((run_pause_t) RUN_PAUSE_USER_CLEARABLE);
 }
 
 int
 hl_unthrottled(void)
 {
-    return unthrottled;
+    return runctl_mode() == RUN_MODE_FAST;
 }
 
 static void
 on_signal(UNUSED(int sig))
 {
     quit_flag = 1;
+}
+
+/* After every pass of the run loop: one quantum ran, or none (paused or early). */
+static void
+loop_pass(void)
+{
+    const uint64_t step_us = force_10ms ? 10000 : 1000;
+    static uint64_t done_us;
+    run_status_t    st;
+
+    if (quit_flag)
+        runctl_request_stop();
+
+    runctl_status(&st);
+    for (; done_us < st.emu_us; done_us += step_us) {
+        emu_ns += step_us * 1000;
+        hl_keys_step();
+        if ((++frame % (force_10ms ? 100 : 1000)) == 0)
+            pc_onesec();
+    }
+
+    if (!hl_unthrottled() || st.state != RUN_RUNNING || (frame % 4) == 0)
+        hl_ctl_poll(0);
 }
 
 static void
@@ -147,8 +174,7 @@ main(int argc, char **argv)
     char       *core_argv[16];
     int         core_argc = 0;
     int         opt;
-    uint64_t    next, step_ns;
-    unsigned    frame = 0;
+    int         unthrottled = 0, paused = 0;
 
     while ((opt = getopt_long(argc, argv, "h", longopts, NULL)) != -1) {
         switch (opt) {
@@ -193,41 +219,12 @@ main(int argc, char **argv)
 
     pc_reset_hard_init();
     is_quit = 0;
-    dopause = 0;
-    step_ns = force_10ms ? 10000000ull : 1000000ull;
-    next    = hl_now_ns();
-
-    while (!quit_flag) {
-        const uint64_t now = hl_now_ns();
-
-        if (paused) {
-            hl_ctl_poll(10);
-            next = hl_now_ns();
-            continue;
-        }
-        if (!unthrottled && now < next) {
-            hl_ctl_poll((int) ((next - now + 999999ull) / 1000000ull));
-            continue;
-        }
-
-        pc_run();
-        emu_ns += step_ns;
-        hl_keys_step();
-        next += step_ns;
-        if (!unthrottled && hl_now_ns() > next + MAX_BEHIND_NS)
-            next = hl_now_ns();
-
-        if ((++frame % (force_10ms ? 100 : 1000)) == 0)
-            pc_onesec();
-        if (nvr_dosave && (frame % (force_10ms ? 200 : 2000)) == 0) {
-            nvr_save();
-            nvr_dosave = 0;
-        }
-        if (unthrottled ? (frame % 4 == 0) : 0)
-            hl_ctl_poll(0);
-        else if (!unthrottled)
-            hl_ctl_poll(0);
-    }
+    if (unthrottled)
+        runctl_set_mode(RUN_MODE_FAST);
+    if (paused)
+        runctl_pause(RUN_PAUSE_USER);
+    runctl_thread_starting();
+    runctl_thread_run_loop(loop_pass);
 
     hl_ctl_announce_exit(exit_code);
     shutdown_emulator();

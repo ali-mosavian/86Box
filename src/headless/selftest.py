@@ -12,6 +12,7 @@ import argparse
 import contextlib
 import json
 import re
+import shutil
 import signal
 import sys
 import tempfile
@@ -45,9 +46,9 @@ class Headless(unittest.TestCase):
         self.assertEqual(r.debug, "hello from the guest\n")
 
     @contextlib.contextmanager
-    def hanging(self, com: str, vm_name: str = "qb-486") -> Iterator[hl86.Client]:
+    def hanging(self, com: str, vm_dir: str | Path = "qb-486") -> Iterator[hl86.Client]:
         """Boot the VM running one .COM that never exits; AUTOEXEC.BAT is restored afterwards."""
-        vm = Path(args.vms) / vm_name
+        vm = Path(args.vms) / vm_dir
         name = com.upper()
         orig = hl86.dos_get(vm / "c.img", "AUTOEXEC.BAT")
         with tempfile.TemporaryDirectory() as tmp:
@@ -247,6 +248,41 @@ class Headless(unittest.TestCase):
     def test_unrolled_jl_and_jge_loops_fall_through(self) -> None:
         """An unrolled JL/JGE loop left through its head: it ran 1001 times, not 100."""
         self.assertEqual(run("qb-486", "jlloop.com").code, 0)
+
+    def test_acpi_sleep_pauses_until_resume(self) -> None:
+        """A guest's ACPI sleep woke at once: the frontend ran its own loop and ignored the run control pause."""
+        with tempfile.TemporaryDirectory() as tmp:
+            vm = Path(tmp) / "acpi"
+            shutil.copytree(Path(args.vms) / "qb-p100", vm)
+            cfg = vm / "86box.cfg"
+            cfg.write_text(cfg.read_text().replace("machine = p55t2p4", "machine = an430tx"))
+            with self.hanging("acpisl.com", vm) as c:
+                out = ""
+                try:
+                    for _ in range(900):
+                        if "SLEEP" in out:
+                            break
+                        if c.status()["video_mode"] == 0x12:  # the BIOS's "Press <F1> to resume"
+                            c.keys(keys=["F1"])
+                        out += c.debug_out()
+                        time.sleep(0.1)
+                    else:
+                        self.fail("acpisl.com never slept")
+                    time.sleep(0.3)
+                    a = c.status()
+                    time.sleep(0.3)
+                    b = c.status()
+                except (hl86.Error, OSError) as e:
+                    self.fail(f"woke without a resume ({e}); output {out!r}")
+                self.assertEqual(b["state"], "paused")
+                self.assertEqual(a["emu_ms"], b["emu_ms"])
+                c.resume()
+                with self.assertRaises(hl86.Exited) as e:
+                    for _ in range(100):
+                        out += c.debug_out()
+                        time.sleep(0.1)
+                self.assertEqual(e.exception.code, 0)
+                self.assertEqual(out + e.exception.debug, "SLEEP\nWOKE\n")
 
     def test_boot_skips_cmos_prompt(self) -> None:
         for vm in ("qb-486", "qb-p100", "qb-ppro200"):
